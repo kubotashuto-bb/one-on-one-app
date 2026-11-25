@@ -18,92 +18,105 @@ const GEMINI_API_KEY = (import.meta.env.VITE_GEMINI_API_KEY || '')
   .replace(/['"`\s]/g, '')
   .trim();
 
-type TaskPriority = '通常' | '急ぎ';
+type RiskLevel = '通常' | '要注意' | '高リスク';
+type ActionStatus = '未着手' | '対応中' | '完了';
+type ActionPriority = '通常' | '急ぎ';
+type MemberRole = '部員' | '部長';
 
 interface FirestoreTimestamp {
   toDate?: () => Date;
 }
 
-interface TaskHistoryItem {
-  id: string;
-  type: 'comment' | 'status' | 'transfer' | 'priority';
-  text: string;
-  actorName: string;
-  actorEmail?: string;
-  statusTo?: '未処理' | '対応中' | '完了';
-  createdAtLabel: string;
-}
-
-interface Task {
-  id: string;
-  title: string;
-  category: string;
-  detail: string;
-  status: '未処理' | '対応中' | '完了';
-  priority?: TaskPriority;
-  recommendedDept?: string;
-  recommendedDepts?: string[];
-  aiReason?: string;
-  tags?: string[];
-  createdBy?: string;
-  creatorName?: string;
-  creatorEmail?: string;
-  creatorPhoto?: string;
-  adminComment?: string;
-  history?: TaskHistoryItem[];
-  createdAt?: FirestoreTimestamp | null;
-}
-
-interface Department {
+interface Member {
   id: string;
   name: string;
-  expertise: string;
+  email: string;
+  department: string;
+  role: MemberRole;
   managerEmail?: string;
 }
 
-interface Proposal {
-  department: string;
-  departments: string[];
-  title: string;
-  detail: string;
-  reason: string;
-  tags: string[];
-  priority?: TaskPriority;
+interface AISummaryResult {
+  overview: string;
+  issues: string;
+  background: string;
+  direction: string;
+  nextActions: string[];
+  riskLevel: RiskLevel;
 }
 
-interface ChatMessage {
-  role: 'user' | 'ai';
-  text: string;
-  time: string;
-  proposal?: Proposal;
-  isSubmitted?: boolean;
-  isError?: boolean;
-}
-
-interface AppNotification {
+interface OneOnOneLog {
   id: string;
-  targetUid?: string;
-  targetEmail?: string;
-  kind?: 'new_task' | 'status_update';
-  taskId: string;
-  taskTitle: string;
+  meetingDate: string; // YYYY-MM-DD
+  memberName: string;
+  memberEmail: string;
   department: string;
-  newStatus: '未処理' | '対応中' | '完了';
-  comment?: string;
-  actorName: string;
-  read: boolean;
+  managerName: string;
+  managerEmail: string;
+  rawMemo: string;
+  privateMemo?: string; // 部長（記録者）のみ閲覧可能
+  transcript: string;
+  docUrl?: string;
+  aiSummary: AISummaryResult;
   createdAt?: FirestoreTimestamp | null;
 }
 
-const QUICK_PROMPTS = [
-  '💻 PCやVPNの調子が悪い',
-  '📄 契約書のチェックをお願いしたい',
-  '💰 経費精算・領収書について聞きたい',
-  '🏢 住所変更や備品の相談がある',
-];
+interface ActionHistoryItem {
+  id: string;
+  type: 'comment' | 'status' | 'priority';
+  text: string;
+  actorName: string;
+  createdAtLabel: string;
+}
 
-const getNowTime = () =>
-  new Date().toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' });
+interface ActionItem {
+  id: string;
+  logId?: string;
+  meetingDate?: string;
+  title: string;
+  detail: string;
+  status: ActionStatus;
+  priority: ActionPriority;
+  owner: '部長' | '部員' | '両方';
+  memberName: string;
+  memberEmail: string;
+  department: string;
+  managerName: string;
+  managerEmail: string;
+  history?: ActionHistoryItem[];
+  createdAt?: FirestoreTimestamp | null;
+}
+
+interface BrowserSpeechRecognitionEvent {
+  resultIndex: number;
+  results: ArrayLike<{
+    isFinal: boolean;
+    0: { transcript: string };
+  }>;
+}
+
+interface BrowserSpeechRecognition {
+  lang: string;
+  continuous: boolean;
+  interimResults: boolean;
+  onresult: ((event: BrowserSpeechRecognitionEvent) => void) | null;
+  onerror: ((event: { error: string }) => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+}
+
+type SpeechRecognitionCtor = new () => BrowserSpeechRecognition;
+
+const getTodayISO = () => {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+};
+
+const getCurrentMonthPrefix = () => getTodayISO().slice(0, 7);
 
 const getNowFullLabel = () =>
   new Date().toLocaleString('ja-JP', {
@@ -112,11 +125,6 @@ const getNowFullLabel = () =>
     hour: '2-digit',
     minute: '2-digit',
   });
-
-const getTaskDate = (ts?: FirestoreTimestamp | null): Date => {
-  if (!ts || typeof ts.toDate !== 'function') return new Date();
-  return ts.toDate();
-};
 
 const formatTimestamp = (ts?: FirestoreTimestamp | null) => {
   if (!ts || typeof ts.toDate !== 'function') return 'たった今';
@@ -128,179 +136,129 @@ const formatTimestamp = (ts?: FirestoreTimestamp | null) => {
   });
 };
 
-const parseEmails = (raw?: string): string[] => {
-  if (!raw) return [];
-  return Array.from(
-    new Set(
-      raw
-        .split(/[,、;\s]+/)
-        .map((e) => e.trim().toLowerCase())
-        .filter((e) => e.includes('@'))
-    )
+// APIキー未設定や混雑時でも止まらないバックアップ自動要約
+const buildFallbackSummary = (
+  memberName: string,
+  rawMemo: string,
+  transcript: string
+): AISummaryResult => {
+  const combined = `${rawMemo}\n${transcript}`.trim();
+  const lines = combined
+    .split(/[\n。]+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length >= 4);
+
+  const highRiskWords = ['転職', '退職', '辞めたい', '限界', '離職', '休職', 'メンタル'];
+  const warnWords = ['不安', '合わない', 'ミスマッチ', '残業', '忙しい', 'きつい', '異動', '不満'];
+
+  const hasHighRisk = highRiskWords.some((w) => combined.includes(w));
+  const hasWarn = warnWords.some((w) => combined.includes(w));
+  const riskLevel: RiskLevel = hasHighRisk ? '高リスク' : hasWarn ? '要注意' : '通常';
+
+  const issueLines = lines.filter((l) =>
+    /課題|不安|転職|退職|合わない|困って|忙しい|残業|希望|悩み|改善|難しい/.test(l)
   );
-};
+  const actionLines = lines.filter((l) =>
+    /する|検討|確認|共有|面談|調整|相談|説得|フォロー|引き継ぎ|目標/.test(l)
+  );
 
-// 単一部署（過去データ）・複数部署のどちらにも対応して配列で返す
-const getTaskDepts = (task: Pick<Task, 'recommendedDept' | 'recommendedDepts'>): string[] => {
-  if (Array.isArray(task.recommendedDepts) && task.recommendedDepts.length > 0) {
-    return Array.from(new Set(task.recommendedDepts.filter(Boolean)));
+  const overview =
+    lines.length > 0
+      ? `${memberName}さんとの1on1を実施。${lines.slice(0, 2).join('。')}。`
+      : `${memberName}さんとの定期1on1を実施し、業務状況と今後の方向性を確認した。`;
+
+  const issues =
+    issueLines.length > 0
+      ? issueLines.slice(0, 2).join('。') + '。'
+      : rawMemo.trim() || '大きな阻害要因は顕在化していないが、継続的な業務負荷の確認が必要。';
+
+  const background =
+    transcript.trim().length > 30
+      ? `面談内の発言内容より、現在の担当業務・環境面でのギャップや負荷状況が背景にあると推察される。`
+      : '日々の業務進行とキャリア志向のすり合わせ過程で挙がった内容。';
+
+  const direction = hasHighRisk
+    ? `本人の強みやキャリア志向を丁寧に再確認し、業務内容の再調整や配置転換の可能性も含めて継続活躍できる環境を早急に検討する。`
+    : hasWarn
+    ? `業務負荷や役割のミスマッチを早期に解消するため、定期的なフォローと業務配分の見直しを進める。`
+    : `現在の強みを伸ばしつつ、来月に向けた具体的な目標とサポート体制を維持する。`;
+
+  const extractedActions: string[] = [];
+  if (actionLines.length > 0) {
+    actionLines.slice(0, 2).forEach((l) => {
+      extractedActions.push(l.length > 42 ? l.slice(0, 42) + '…' : l);
+    });
   }
-  if (task.recommendedDept && task.recommendedDept.trim()) {
-    return [task.recommendedDept.trim()];
+  if (extractedActions.length === 0) {
+    extractedActions.push(`${memberName}さんの強み・希望業務の棚卸しフォロー面談を設定する`);
+    extractedActions.push('次回1on1までに現状の業務負荷と改善案をすり合わせる');
   }
-  return [];
-};
-
-const getProposalDepts = (proposal: Proposal): string[] => {
-  if (Array.isArray(proposal.departments) && proposal.departments.length > 0) {
-    return Array.from(new Set(proposal.departments.filter(Boolean)));
-  }
-  if (proposal.department && proposal.department.trim()) {
-    return [proposal.department.trim()];
-  }
-  return [];
-};
-
-const isSameDeptSet = (a: string[], b: string[]): boolean => {
-  if (a.length !== b.length) return false;
-  const setA = new Set(a);
-  return b.every((item) => setA.has(item));
-};
-
-// タイトル・詳細・複数部署・依頼者・タグ・履歴コメントを横断検索
-const matchesSearchQuery = (task: Task, rawQuery: string): boolean => {
-  const tokens = rawQuery
-    .trim()
-    .toLowerCase()
-    .split(/\s+/)
-    .filter(Boolean);
-  if (tokens.length === 0) return true;
-
-  const historyText = (task.history || []).map((h) => `${h.text} ${h.actorName}`).join(' ');
-  const searchable = [
-    task.title,
-    task.detail,
-    getTaskDepts(task).join(' '),
-    task.creatorName || '',
-    task.creatorEmail || '',
-    task.adminComment || '',
-    task.priority || '通常',
-    (task.tags || []).join(' '),
-    historyText,
-  ]
-    .join(' ')
-    .toLowerCase();
-
-  return tokens.every((token) => searchable.includes(token));
-};
-
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-const buildFallbackProposal = (userText: string, departments: Department[]): Proposal => {
-  const normalizedInput = userText.toLowerCase();
-  const scored = departments.map((dept) => {
-    const rawTokens = `${dept.name} ${dept.expertise}`
-      .split(/[、,・\s（）()／/「」『』]+/)
-      .map((t) => t.trim())
-      .filter((t) => t.length >= 2);
-
-    const hits: string[] = [];
-    for (const token of rawTokens) {
-      if (normalizedInput.includes(token.toLowerCase())) {
-        hits.push(token);
-      } else {
-        const subWords =
-          token.match(/[A-Za-z0-9]{2,}|[\u4E00-\u9FFF]{2,4}|[ァ-ヶー]{2,}/g) || [];
-        for (const sub of subWords) {
-          if (normalizedInput.includes(sub.toLowerCase()) && !hits.includes(sub)) {
-            hits.push(sub);
-          }
-        }
-      }
-    }
-    return { dept, hits };
-  });
-
-  scored.sort((a, b) => b.hits.length - a.hits.length);
-
-  const topScore = scored[0]?.hits.length ?? 0;
-  // 複数部署に明確なキーワード一致がある場合は複数ピックアップ
-  const picked =
-    topScore > 0
-      ? scored.filter((item, idx) => idx === 0 || item.hits.length >= Math.max(2, topScore))
-      : [scored[0]];
-
-  const pickedNames = picked.map((p) => p.dept.name);
-  const allMatchedKeywords = Array.from(new Set(picked.flatMap((p) => p.hits)));
-
-  const isUrgent = /急ぎ|至急|緊急|本日中|今日中|止まっ|つながら|映らない/.test(userText);
-  const cleanTitle = userText.replace(/\s+/g, ' ').slice(0, 19);
 
   return {
-    department: pickedNames.join('・'),
-    departments: pickedNames,
-    title: cleanTitle + (userText.length > 19 ? '…' : ''),
-    detail: userText,
-    reason:
-      allMatchedKeywords.length > 0
-        ? `相談内容のキーワード（${allMatchedKeywords.slice(0, 4).join('・')}）から「${pickedNames.join('・')}」を担当候補と判定しました。`
-        : `登録されている得意分野から「${pickedNames[0]}」を窓口として選択しました。`,
-    tags:
-      allMatchedKeywords.length > 0
-        ? allMatchedKeywords.slice(0, 3)
-        : ['社内相談', pickedNames[0]],
-    priority: isUrgent ? '急ぎ' : '通常',
+    overview,
+    issues,
+    background,
+    direction,
+    nextActions: Array.from(new Set(extractedActions)).slice(0, 3),
+    riskLevel,
   };
 };
 
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
-  const [activeTab, setActiveTab] = useState<'chat' | 'mypage' | 'admin'>('chat');
-  const [mypageView, setMypageView] = useState<'requested' | 'assigned'>('requested');
-  const [adminView, setAdminView] = useState<'board' | 'analytics' | 'departments'>('board');
-  const [deptFilter, setDeptFilter] = useState<string>('すべて');
-  const [myDeptFilter, setMyDeptFilter] = useState<string>('すべて');
+  const [activeTab, setActiveTab] = useState<'overview' | 'record' | 'board' | 'members'>(
+    'overview'
+  );
 
-  // キーワード検索 ＆ 優先度絞り込み用State
-  const [boardSearchQuery, setBoardSearchQuery] = useState('');
+  // Firestoreデータ
+  const [members, setMembers] = useState<Member[]>([]);
+  const [logs, setLogs] = useState<OneOnOneLog[]>([]);
+  const [actions, setActions] = useState<ActionItem[]>([]);
+
+  // 実施状況＆ログ詳細用State
+  const [selectedMonth, setSelectedMonth] = useState(getCurrentMonthPrefix());
+  const [overviewDeptFilter, setOverviewDeptFilter] = useState('すべて');
+  const [overviewSearch, setOverviewSearch] = useState('');
+  const [selectedLogId, setSelectedLogId] = useState<string | null>(null);
+
+  // 1on1記録・録音・AI要約フォーム用State
+  const [meetingDate, setMeetingDate] = useState(getTodayISO());
+  const [selectedMemberId, setSelectedMemberId] = useState('');
+  const [manualMemberName, setManualMemberName] = useState('');
+  const [manualMemberEmail, setManualMemberEmail] = useState('');
+  const [manualDepartment, setManualDepartment] = useState('');
+  const [rawMemo, setRawMemo] = useState('');
+  const [privateMemo, setPrivateMemo] = useState('');
+  const [transcript, setTranscript] = useState('');
+  const [docUrl, setDocUrl] = useState('');
+
+  // リアルタイム音声認識State
+  const [isRecording, setIsRecording] = useState(false);
+  const [interimText, setInterimText] = useState('');
+  const recognitionRef = useRef<BrowserSpeechRecognition | null>(null);
+  const keepRecordingRef = useRef(false);
+
+  // AI要約結果・編集State
+  const [isSummarizing, setIsSummarizing] = useState(false);
+  const [summaryDraft, setSummaryDraft] = useState<AISummaryResult | null>(null);
+  const [selectedActionsToCreate, setSelectedActionsToCreate] = useState<boolean[]>([]);
+  const [isSavingLog, setIsSavingLog] = useState(false);
+
+  // 課題ボード用State
+  const [boardSearch, setBoardSearch] = useState('');
+  const [boardDeptFilter, setBoardDeptFilter] = useState('すべて');
   const [boardUrgentOnly, setBoardUrgentOnly] = useState(false);
-  const [mypageSearchQuery, setMypageSearchQuery] = useState('');
-
-  const [tasks, setTasks] = useState<Task[]>([]);
-  const [departments, setDepartments] = useState<Department[]>([]);
-  const [notifications, setNotifications] = useState<AppNotification[]>([]);
-  const [showNotifMenu, setShowNotifMenu] = useState(false);
-  const [commentDrafts, setCommentDrafts] = useState<Record<string, string>>({});
-
-  // 詳細モーダル用State
-  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const [selectedActionId, setSelectedActionId] = useState<string | null>(null);
   const [modalCommentText, setModalCommentText] = useState('');
   const [isPostingComment, setIsPostingComment] = useState(false);
-  const [editTaskDepts, setEditTaskDepts] = useState<string[]>([]);
-  const [isUpdatingDepts, setIsUpdatingDepts] = useState(false);
 
-  // 部署管理・兼任設定用State
-  const [newDeptName, setNewDeptName] = useState('');
-  const [newDeptExpertise, setNewDeptExpertise] = useState('');
-  const [newDeptEmail, setNewDeptEmail] = useState('');
-  const [deptEmailDrafts, setDeptEmailDrafts] = useState<Record<string, string>>({});
-  const [deptExpertiseDrafts, setDeptExpertiseDrafts] = useState<Record<string, string>>({});
-  const [bulkEmail, setBulkEmail] = useState('');
-  const [bulkDeptIds, setBulkDeptIds] = useState<string[]>([]);
-
-  // チャット用State
-  const [messages, setMessages] = useState<ChatMessage[]>([
-    {
-      role: 'ai',
-      text: 'こんにちは！社内ヘルプデスクAIです。\n困っていることをそのまま話しかけていただければ、最適な担当部署をお探しして依頼をまとめます。',
-      time: getNowTime(),
-    },
-  ]);
-  const [inputText, setInputText] = useState('');
-  const [isThinking, setIsThinking] = useState(false);
-  const [thinkingText, setThinkingText] = useState('');
-  const [isSendingBoard, setIsSendingBoard] = useState(false);
-  const chatEndRef = useRef<HTMLDivElement>(null);
+  // 部員マスタ管理用State
+  const [newMemberName, setNewMemberName] = useState('');
+  const [newMemberEmail, setNewMemberEmail] = useState('');
+  const [newMemberDept, setNewMemberDept] = useState('');
+  const [newMemberRole, setNewMemberRole] = useState<MemberRole>('部員');
+  const [bulkPasteText, setBulkPasteText] = useState('');
+  const [isBulkImporting, setIsBulkImporting] = useState(false);
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
@@ -310,52 +268,35 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const unsubscribe = onSnapshot(
-      query(collection(db, 'tasks'), orderBy('createdAt', 'desc')),
-      (snapshot) => {
-        setTasks(snapshot.docs.map((d) => ({ id: d.id, ...d.data() })) as Task[]);
+    const unsubMembers = onSnapshot(collection(db, 'members'), (snap) => {
+      setMembers(snap.docs.map((d) => ({ id: d.id, ...d.data() })) as Member[]);
+    });
+    const unsubLogs = onSnapshot(
+      query(collection(db, 'oneOnOneLogs'), orderBy('createdAt', 'desc')),
+      (snap) => {
+        setLogs(snap.docs.map((d) => ({ id: d.id, ...d.data() })) as OneOnOneLog[]);
       }
     );
-    return () => unsubscribe();
-  }, []);
-
-  useEffect(() => {
-    const unsubscribe = onSnapshot(collection(db, 'departments'), (snapshot) => {
-      setDepartments(snapshot.docs.map((d) => ({ id: d.id, ...d.data() })) as Department[]);
-    });
-    return () => unsubscribe();
-  }, []);
-
-  useEffect(() => {
-    const unsubscribe = onSnapshot(
-      query(collection(db, 'notifications'), orderBy('createdAt', 'desc')),
-      (snapshot) => {
-        setNotifications(
-          snapshot.docs.map((d) => ({ id: d.id, ...d.data() })) as AppNotification[]
-        );
+    const unsubActions = onSnapshot(
+      query(collection(db, 'oneOnOneActions'), orderBy('createdAt', 'desc')),
+      (snap) => {
+        setActions(snap.docs.map((d) => ({ id: d.id, ...d.data() })) as ActionItem[]);
       }
     );
-    return () => unsubscribe();
+    return () => {
+      unsubMembers();
+      unsubLogs();
+      unsubActions();
+    };
   }, []);
 
+  // アンマウント時に録音を確実に停止
   useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, isThinking, thinkingText]);
-
-  const openTaskModal = (task: Task) => {
-    setSelectedTaskId(task.id);
-    setEditTaskDepts(getTaskDepts(task));
-    setModalCommentText('');
-  };
-
-  // 指定された複数部署の担当部長メールアドレスを重複なく取得
-  const collectManagerEmailsForDepts = (deptNameList: string[]): string[] => {
-    const emails = deptNameList.flatMap((name) => {
-      const found = departments.find((d) => d.name === name);
-      return parseEmails(found?.managerEmail);
-    });
-    return Array.from(new Set(emails));
-  };
+    return () => {
+      keepRecordingRef.current = false;
+      recognitionRef.current?.stop();
+    };
+  }, []);
 
   const handleLogin = async () => {
     try {
@@ -369,689 +310,412 @@ export default function App() {
     if (confirm('ログアウトしますか？')) await signOut(auth);
   };
 
-  const requestAIReply = async (targetMessages: ChatMessage[]) => {
-    setIsThinking(true);
-    setThinkingText('最適な部署を考えています...');
+  // =========================================
+  // 🎙️ リアルタイム録音＆文字起こし（Web Speech API）
+  // =========================================
+  const handleStartRecording = () => {
+    const win = window as unknown as {
+      SpeechRecognition?: SpeechRecognitionCtor;
+      webkitSpeechRecognition?: SpeechRecognitionCtor;
+    };
+    const SpeechRec = win.SpeechRecognition || win.webkitSpeechRecognition;
+    if (!SpeechRec) {
+      alert(
+        'お使いのブラウザはリアルタイム音声文字起こしに対応していません。Google Chrome または Microsoft Edge をご利用ください。'
+      );
+      return;
+    }
 
+    const recognition = new SpeechRec();
+    recognition.lang = 'ja-JP';
+    recognition.continuous = true;
+    recognition.interimResults = true;
+
+    recognition.onresult = (event) => {
+      let finalChunk = '';
+      let interimChunk = '';
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const res = event.results[i];
+        if (res.isFinal) {
+          finalChunk += res[0].transcript;
+        } else {
+          interimChunk += res[0].transcript;
+        }
+      }
+      setInterimText(interimChunk);
+      if (finalChunk.trim()) {
+        setTranscript((prev) => (prev ? `${prev}\n${finalChunk.trim()}` : finalChunk.trim()));
+      }
+    };
+
+    recognition.onerror = (event) => {
+      if (event.error === 'not-allowed') {
+        alert('マイクの使用が許可されていません。ブラウザのアドレスバーからマイクを許可してください。');
+        keepRecordingRef.current = false;
+        setIsRecording(false);
+        setInterimText('');
+      }
+    };
+
+    recognition.onend = () => {
+      if (keepRecordingRef.current) {
+        try {
+          recognition.start();
+        } catch {
+          setIsRecording(false);
+        }
+      } else {
+        setIsRecording(false);
+        setInterimText('');
+      }
+    };
+
+    recognitionRef.current = recognition;
+    keepRecordingRef.current = true;
+    setIsRecording(true);
+    recognition.start();
+  };
+
+  const handleStopRecording = () => {
+    keepRecordingRef.current = false;
+    recognitionRef.current?.stop();
+    setIsRecording(false);
+    setInterimText('');
+  };
+
+  // =========================================
+  // 🤖 AI要約生成（Gemini API + バックアップ自動要約）
+  // =========================================
+  const getTargetMemberInfo = () => {
+    const found = members.find((m) => m.id === selectedMemberId);
+    if (found) {
+      return {
+        name: found.name,
+        email: found.email.toLowerCase(),
+        department: found.department,
+      };
+    }
+    return {
+      name: manualMemberName.trim(),
+      email: manualMemberEmail.trim().toLowerCase(),
+      department: manualDepartment.trim() || '未設定',
+    };
+  };
+
+  const handleGenerateSummary = async () => {
+    const target = getTargetMemberInfo();
+    if (!target.name) {
+      alert('先に対象の部員を選択（または氏名を入力）してください。');
+      return;
+    }
+    if (!rawMemo.trim() && !transcript.trim()) {
+      alert('ざっくりメモ、または会話ログ（文字起こし）を入力してください。');
+      return;
+    }
+
+    setIsSummarizing(true);
     try {
-      const deptListText = departments
-        .map((d) => `・${d.name}（得意分野: ${d.expertise}）`)
-        .join('\n');
-      const conversationHistory = targetMessages
-        .filter((m) => !m.isError)
-        .map((m) => `${m.role === 'user' ? '社員' : 'AI'}: ${m.text}`)
-        .join('\n');
+      if (GEMINI_API_KEY) {
+        const prompt = `あなたはマネジメント支援AIです。以下の1on1面談の「ざっくりメモ」と「会話ログ全文」を分析し、面談記録とネクストアクションを構造化JSONのみで出力してください。
 
-      const systemPrompt = `あなたは親切な社内ヘルプデスク案内AIです。以下の【部署リスト】から最適な担当部署を判定してください。複数部署の連携が必要な場合は複数選んで構いません。
-【部署リスト】
-${deptListText}
+【対象部員】${target.name}（${target.department}）
+【ざっくりメモ】
+${rawMemo || 'なし'}
+【会話ログ全文】
+${transcript || 'なし'}
 
-【ルール】
-1. 担当部署が判断できる場合は、深掘りしすぎず素早く依頼案（proposal）を作成して提示してください。
-2. 情報が曖昧すぎて部署が判断できない場合のみ、優しく1つだけ質問を返し proposal は null にしてください。
-3. 必ず以下のJSON形式のみで出力してください。
-
-【出力JSON】
+【出力JSON形式】
 {
-  "reply": "社員への自然な返信メッセージ",
-  "proposal": {
-    "departments": ["リストにある部署名1", "必要に応じて部署名2"],
-    "title": "管理ボード用の簡潔なタイトル（20文字以内）",
-    "detail": "担当部署がすぐ動けるように要点をまとめた依頼詳細",
-    "reason": "この部署をおすすめする理由（1文）",
-    "tags": ["タグ1", "タグ2", "タグ3"],
-    "priority": "通常 または 急ぎ"
-  }
-}
+  "overview": "面談全体の簡潔な要約（1〜2文）",
+  "issues": "現状の課題（箇条書きや簡潔な文章）",
+  "background": "課題の背景・要因",
+  "direction": "解決に向けた方向性・サポート方針",
+  "nextActions": ["具体的なネクストアクション1", "具体的なネクストアクション2"],
+  "riskLevel": "通常 または 要注意 または 高リスク（離職・転職意向・強い不調がある場合は高リスク）"
+}`;
 
-【これまでの会話】
-${conversationHistory}`;
-
-      const url =
-        'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=' +
-        GEMINI_API_KEY;
-
-      const maxAttempts = 3;
-      let parsed: {
-        reply: string;
-        proposal?: (Partial<Proposal> & { department?: string; departments?: string[] }) | null;
-      } | null = null;
-
-      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const url =
+          'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=' +
+          GEMINI_API_KEY;
         const response = await fetch(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            contents: [{ role: 'user', parts: [{ text: systemPrompt }] }],
+            contents: [{ role: 'user', parts: [{ text: prompt }] }],
             generationConfig: { responseMimeType: 'application/json' },
           }),
         });
 
-        if (!response.ok) {
-          const err = await response.json().catch(() => ({}));
-          const errMsg = err?.error?.message || `通信エラー (${response.status})`;
-          const isCongested =
-            response.status === 503 ||
-            response.status === 429 ||
-            errMsg.includes('high demand') ||
-            errMsg.includes('overloaded');
-
-          if (isCongested && attempt < maxAttempts) {
-            setThinkingText(
-              `Googleサーバー混雑のため自動で再接続中... (${attempt}/${maxAttempts - 1})`
-            );
-            await sleep(attempt * 2000);
-            continue;
-          }
-          throw new Error(errMsg);
-        }
-
-        const data = await response.json();
-        const rawText = data.candidates[0].content.parts[0].text;
-        parsed = JSON.parse(rawText.replace(/```json\n?|\n?```/g, '').trim());
-        break;
-      }
-
-      if (parsed) {
-        let normalizedProposal: Proposal | undefined;
-        if (parsed.proposal) {
-          const rawDepts =
-            Array.isArray(parsed.proposal.departments) && parsed.proposal.departments.length > 0
-              ? parsed.proposal.departments
-              : parsed.proposal.department
-              ? [parsed.proposal.department]
-              : [departments[0]?.name || '未分類'];
-          const uniqueDepts = Array.from(new Set(rawDepts.filter(Boolean)));
-          normalizedProposal = {
-            department: uniqueDepts.join('・'),
-            departments: uniqueDepts,
-            title: parsed.proposal.title || '社内相談',
-            detail: parsed.proposal.detail || '',
-            reason: parsed.proposal.reason || '',
-            tags: Array.isArray(parsed.proposal.tags) ? parsed.proposal.tags : [],
-            priority: parsed.proposal.priority === '急ぎ' ? '急ぎ' : '通常',
+        if (response.ok) {
+          const data = await response.json();
+          const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+          const parsed = JSON.parse(rawText.replace(/```json\n?|\n?```/g, '').trim()) as Partial<
+            AISummaryResult
+          >;
+          const normalized: AISummaryResult = {
+            overview: parsed.overview || '',
+            issues: parsed.issues || '',
+            background: parsed.background || '',
+            direction: parsed.direction || '',
+            nextActions: Array.isArray(parsed.nextActions) ? parsed.nextActions : [],
+            riskLevel:
+              parsed.riskLevel === '高リスク' || parsed.riskLevel === '要注意'
+                ? parsed.riskLevel
+                : '通常',
           };
+          setSummaryDraft(normalized);
+          setSelectedActionsToCreate(normalized.nextActions.map(() => true));
+          return;
         }
-
-        setMessages([
-          ...targetMessages,
-          {
-            role: 'ai',
-            text: parsed.reply,
-            time: getNowTime(),
-            proposal: normalizedProposal,
-          },
-        ]);
       }
-    } catch (error: unknown) {
-      const msg = error instanceof Error ? error.message : '不明なエラー';
-      const isHighDemand =
-        msg.includes('high demand') || msg.includes('503') || msg.includes('429');
-      setMessages([
-        ...targetMessages,
-        {
-          role: 'ai',
-          text: isHighDemand
-            ? '⚠️ 現在GoogleのAIサーバーが大変混み合っています。\n「もう一度AIで試す」か、待たずにすぐカードを作れる「バックアップ自動判定」をご利用ください！'
-            : `⚠️ エラーが発生しました: ${msg}`,
-          time: getNowTime(),
-          isError: true,
-        },
-      ]);
+
+      // APIキー未設定・エラー時はシームレスにバックアップ自動要約を実行
+      const fallback = buildFallbackSummary(target.name, rawMemo, transcript);
+      setSummaryDraft(fallback);
+      setSelectedActionsToCreate(fallback.nextActions.map(() => true));
+    } catch {
+      const fallback = buildFallbackSummary(target.name, rawMemo, transcript);
+      setSummaryDraft(fallback);
+      setSelectedActionsToCreate(fallback.nextActions.map(() => true));
     } finally {
-      setIsThinking(false);
-      setThinkingText('');
+      setIsSummarizing(false);
     }
   };
 
-  const handleSendMessage = async (overrideText?: string) => {
-    const textToSend = (overrideText ?? inputText).trim();
-    if (!textToSend || isThinking) return;
-    if (departments.length === 0) {
-      alert('先に「全体管理 ＞ 部署・メール管理」から部署を1つ以上登録してください！');
+  // =========================================
+  // 💾 1on1ログ保存 ＋ ネクストアクションを課題ボードへ自動登録
+  // =========================================
+  const handleSaveOneOnOne = async () => {
+    if (!user) return;
+    const target = getTargetMemberInfo();
+    if (!target.name || !target.email) {
+      alert('対象部員の氏名とメールアドレスを入力（またはマスタから選択）してください。');
       return;
     }
 
-    const userMessage: ChatMessage = {
-      role: 'user',
-      text: textToSend,
-      time: getNowTime(),
-    };
-    const updatedMessages = [...messages.filter((m) => !m.isError), userMessage];
-    setMessages(updatedMessages);
-    setInputText('');
-    await requestAIReply(updatedMessages);
-  };
+    const finalSummary =
+      summaryDraft || buildFallbackSummary(target.name, rawMemo, transcript);
 
-  const handleRetry = async () => {
-    if (isThinking) return;
-    const cleanMessages = messages.filter((m) => !m.isError);
-    setMessages(cleanMessages);
-    await requestAIReply(cleanMessages);
-  };
-
-  const handleUseFallback = () => {
-    const cleanMessages = messages.filter((m) => !m.isError);
-    const userTexts = cleanMessages
-      .filter((m) => m.role === 'user')
-      .map((m) => m.text)
-      .join(' ');
-    if (!userTexts || departments.length === 0) return;
-
-    const proposal = buildFallbackProposal(userTexts, departments);
-    setMessages([
-      ...cleanMessages,
-      {
-        role: 'ai',
-        text: `バックアップ自動判定により、「${proposal.departments.join('・')}」宛ての依頼カードを作成しました！複数部署の選択や優先度をご確認のうえ送信してください。`,
-        time: getNowTime(),
-        proposal,
-      },
-    ]);
-  };
-
-  // チャット上の提案カードで複数部署をトグル選択
-  const handleToggleProposalDept = (msgIndex: number, deptName: string) => {
-    setMessages((prev) =>
-      prev.map((m, idx) => {
-        if (idx !== msgIndex || !m.proposal) return m;
-        const current = getProposalDepts(m.proposal);
-        const exists = current.includes(deptName);
-        if (exists && current.length <= 1) {
-          return m; // 最低1部署は選択状態を維持
-        }
-        const nextDepts = exists
-          ? current.filter((d) => d !== deptName)
-          : [...current, deptName];
-        return {
-          ...m,
-          proposal: {
-            ...m.proposal,
-            departments: nextDepts,
-            department: nextDepts.join('・'),
-          },
-        };
-      })
-    );
-  };
-
-  const handleUpdateProposalPriority = (msgIndex: number, priority: TaskPriority) => {
-    setMessages((prev) =>
-      prev.map((m, idx) =>
-        idx === msgIndex && m.proposal
-          ? { ...m, proposal: { ...m.proposal, priority } }
-          : m
-      )
-    );
-  };
-
-  const handleCreateTaskFromProposal = async (proposal: Proposal, msgIndex: number) => {
-    const selectedDepts = getProposalDepts(proposal);
-    if (selectedDepts.length === 0) {
-      alert('担当部署を1つ以上選択してください。');
-      return;
-    }
-
-    setIsSendingBoard(true);
+    setIsSavingLog(true);
     try {
-      const priority: TaskPriority = proposal.priority === '急ぎ' ? '急ぎ' : '通常';
-      const deptDisplay = selectedDepts.join('・');
-      const initialHistory: TaskHistoryItem[] = [
-        {
-          id: `${Date.now()}_init`,
-          type: 'comment',
-          text: `新規依頼を作成しました（担当：${deptDisplay} ／ 優先度：${priority}）：${proposal.title}`,
-          actorName: user?.displayName || '社員',
-          actorEmail: (user?.email || '').toLowerCase(),
-          createdAtLabel: getNowFullLabel(),
-        },
-      ];
+      const managerEmail = (user.email || '').toLowerCase();
+      const managerName = user.displayName || '部長';
 
-      const taskRef = await addDoc(collection(db, 'tasks'), {
-        title: proposal.title,
-        category: 'AIチャット相談',
-        detail: proposal.detail,
-        status: '未処理',
-        priority,
-        recommendedDept: deptDisplay,
-        recommendedDepts: selectedDepts,
-        aiReason: proposal.reason,
-        tags: proposal.tags || [],
-        createdBy: user?.uid || 'unknown',
-        creatorName: user?.displayName || '社員',
-        creatorEmail: (user?.email || '').toLowerCase(),
-        creatorPhoto: user?.photoURL || '',
-        history: initialHistory,
+      const logRef = await addDoc(collection(db, 'oneOnOneLogs'), {
+        meetingDate,
+        memberName: target.name,
+        memberEmail: target.email,
+        department: target.department,
+        managerName,
+        managerEmail,
+        rawMemo: rawMemo.trim(),
+        privateMemo: privateMemo.trim(),
+        transcript: transcript.trim(),
+        docUrl: docUrl.trim(),
+        aiSummary: finalSummary,
         createdAt: serverTimestamp(),
       });
 
-      const managerEmails = collectManagerEmailsForDepts(selectedDepts);
+      const actionsToRegister = finalSummary.nextActions.filter(
+        (text, idx) => text.trim() && (selectedActionsToCreate[idx] ?? true)
+      );
 
-      if (managerEmails.length > 0) {
-        const titleWithPriority =
-          priority === '急ぎ' ? `【急ぎ】${proposal.title}` : proposal.title;
+      if (actionsToRegister.length > 0) {
+        const defaultPriority: ActionPriority =
+          finalSummary.riskLevel === '高リスク' ? '急ぎ' : '通常';
         await Promise.all(
-          managerEmails.map((email) =>
-            addDoc(collection(db, 'notifications'), {
-              targetEmail: email,
-              kind: 'new_task',
-              taskId: taskRef.id,
-              taskTitle: titleWithPriority,
-              department: deptDisplay,
-              newStatus: '未処理',
-              actorName: user?.displayName || '社員',
-              read: false,
+          actionsToRegister.map((actionText) =>
+            addDoc(collection(db, 'oneOnOneActions'), {
+              logId: logRef.id,
+              meetingDate,
+              title: actionText.trim(),
+              detail: `${meetingDate} の1on1（${target.name}）より抽出：${finalSummary.direction}`,
+              status: '未着手',
+              priority: defaultPriority,
+              owner: '両方',
+              memberName: target.name,
+              memberEmail: target.email,
+              department: target.department,
+              managerName,
+              managerEmail,
+              history: [
+                {
+                  id: `${Date.now()}_init`,
+                  type: 'comment',
+                  text: `1on1記録からネクストアクションを登録しました`,
+                  actorName: managerName,
+                  createdAtLabel: getNowFullLabel(),
+                },
+              ],
               createdAt: serverTimestamp(),
             })
           )
         );
       }
 
-      setMessages((prev) =>
-        prev.map((m, idx) => (idx === msgIndex ? { ...m, isSubmitted: true } : m))
-      );
+      // フォームをリセット
+      setRawMemo('');
+      setPrivateMemo('');
+      setTranscript('');
+      setDocUrl('');
+      setSummaryDraft(null);
+      setSelectedActionsToCreate([]);
 
-      const mailInfo =
-        managerEmails.length > 0
-          ? `\n（担当部長メール: ${managerEmails.join(', ')} へ通知を送信します）`
-          : '\n（※担当部長メールアドレスが未設定のためメール通知はスキップされました）';
-      alert(`🎉 「${deptDisplay}」宛てに依頼を送信しました！${mailInfo}`);
-      setActiveTab('mypage');
-      setMypageView('requested');
+      alert(
+        `✅ ${target.name}さんの1on1ログを保存しました！\n（閲覧可能：${managerEmail} / ${target.email} の2名限定）` +
+          (actionsToRegister.length > 0
+            ? `\n📋 ネクストアクション ${actionsToRegister.length}件を課題ボードへ登録しました。`
+            : '')
+      );
+      setActiveTab('overview');
     } catch {
-      alert('登録に失敗しました。');
+      alert('保存に失敗しました。Firestoreの設定を確認してください。');
     } finally {
-      setIsSendingBoard(false);
+      setIsSavingLog(false);
     }
   };
 
-  const handleStatusChange = async (
-    task: Task,
-    newStatus: '未処理' | '対応中' | '完了',
-    overrideMemo?: string
-  ) => {
-    const memo = (overrideMemo ?? commentDrafts[task.id] ?? '').trim();
+  // 課題ボード操作
+  const handleChangeActionStatus = async (item: ActionItem, nextStatus: ActionStatus) => {
+    if (item.status === nextStatus) return;
     const actor = user?.displayName || '担当者';
-    const timeLabel = getNowFullLabel();
-
-    const newHistoryItems: TaskHistoryItem[] = [
-      {
-        id: `${Date.now()}_st_${Math.random().toString(36).slice(2, 6)}`,
-        type: 'status',
-        text: `ステータスを「${task.status}」から「${newStatus}」に変更しました`,
-        actorName: actor,
-        actorEmail: (user?.email || '').toLowerCase(),
-        statusTo: newStatus,
-        createdAtLabel: timeLabel,
-      },
-    ];
-
-    if (memo) {
-      newHistoryItems.push({
-        id: `${Date.now()}_cm_${Math.random().toString(36).slice(2, 6)}`,
-        type: 'comment',
-        text: memo,
-        actorName: actor,
-        actorEmail: (user?.email || '').toLowerCase(),
-        createdAtLabel: timeLabel,
-      });
-    }
-
-    const updatePayload: Record<string, unknown> = {
-      status: newStatus,
-      history: arrayUnion(...newHistoryItems),
-    };
-    if (memo) {
-      updatePayload.adminComment = memo;
-    }
-
-    await updateDoc(doc(db, 'tasks', task.id), updatePayload);
-
-    const taskDepts = getTaskDepts(task);
-    const deptDisplay = taskDepts.join('・') || '担当部署';
-    const requesterEmail = (task.creatorEmail || '').trim().toLowerCase();
-    const managerEmails = collectManagerEmailsForDepts(taskDepts);
-
-    const recipientEmails = Array.from(
-      new Set([requesterEmail, ...managerEmails].filter(Boolean))
-    );
-
-    if (recipientEmails.length > 0) {
-      await Promise.all(
-        recipientEmails.map((email) =>
-          addDoc(collection(db, 'notifications'), {
-            targetUid: email === requesterEmail ? task.createdBy || '' : '',
-            targetEmail: email,
-            kind: 'status_update',
-            taskId: task.id,
-            taskTitle: task.title,
-            department: deptDisplay,
-            newStatus,
-            comment: memo,
-            actorName: actor,
-            read: false,
-            createdAt: serverTimestamp(),
-          })
-        )
-      );
-    } else if (task.createdBy && task.createdBy !== 'unknown') {
-      await addDoc(collection(db, 'notifications'), {
-        targetUid: task.createdBy,
-        targetEmail: '',
-        kind: 'status_update',
-        taskId: task.id,
-        taskTitle: task.title,
-        department: deptDisplay,
-        newStatus,
-        comment: memo,
-        actorName: actor,
-        read: false,
-        createdAt: serverTimestamp(),
-      });
-    }
-
-    if (memo && !overrideMemo) {
-      setCommentDrafts((prev) => ({ ...prev, [task.id]: '' }));
-    }
-  };
-
-  const handlePriorityChange = async (task: Task, nextPriority: TaskPriority) => {
-    const currentPriority: TaskPriority = task.priority === '急ぎ' ? '急ぎ' : '通常';
-    if (currentPriority === nextPriority) return;
-
-    const actor = user?.displayName || '担当者';
-    const entry: TaskHistoryItem = {
-      id: `${Date.now()}_pr_${Math.random().toString(36).slice(2, 6)}`,
-      type: 'priority',
-      text: `優先度を「${currentPriority}」から「${nextPriority}」に変更しました`,
+    const entry: ActionHistoryItem = {
+      id: `${Date.now()}_st`,
+      type: 'status',
+      text: `ステータスを「${item.status}」から「${nextStatus}」に変更しました`,
       actorName: actor,
-      actorEmail: (user?.email || '').toLowerCase(),
       createdAtLabel: getNowFullLabel(),
     };
+    await updateDoc(doc(db, 'oneOnOneActions', item.id), {
+      status: nextStatus,
+      history: arrayUnion(entry),
+    });
+  };
 
-    await updateDoc(doc(db, 'tasks', task.id), {
+  const handleChangeActionPriority = async (item: ActionItem, nextPriority: ActionPriority) => {
+    if (item.priority === nextPriority) return;
+    const actor = user?.displayName || '担当者';
+    const entry: ActionHistoryItem = {
+      id: `${Date.now()}_pr`,
+      type: 'priority',
+      text: `優先度を「${item.priority}」から「${nextPriority}」に変更しました`,
+      actorName: actor,
+      createdAtLabel: getNowFullLabel(),
+    };
+    await updateDoc(doc(db, 'oneOnOneActions', item.id), {
       priority: nextPriority,
       history: arrayUnion(entry),
     });
   };
 
-  // モーダル内で複数部署のチェック切り替え
-  const handleToggleModalDept = (deptName: string) => {
-    setEditTaskDepts((prev) => {
-      if (prev.includes(deptName)) {
-        if (prev.length <= 1) return prev; // 最低1部署は残す
-        return prev.filter((d) => d !== deptName);
-      }
-      return [...prev, deptName];
-    });
-  };
-
-  // モーダル内からの担当部署（複数可）の更新・追加・振り替え
-  const handleUpdateTaskDepartments = async (task: Task) => {
-    const prevDepts = getTaskDepts(task);
-    const nextDepts = Array.from(new Set(editTaskDepts.filter(Boolean)));
-    if (nextDepts.length === 0 || isSameDeptSet(prevDepts, nextDepts) || isUpdatingDepts) {
-      return;
-    }
-
-    const prevLabel = prevDepts.join('・') || '未分類';
-    const nextLabel = nextDepts.join('・');
-    const addedDepts = nextDepts.filter((d) => !prevDepts.includes(d));
-
-    if (
-      !confirm(
-        `担当部署を「${prevLabel}」から「${nextLabel}」へ更新しますか？` +
-          (addedDepts.length > 0
-            ? `\n（新たに追加される ${addedDepts.join('・')} の部長アドレスへ通知が送られます）`
-            : '')
-      )
-    ) {
-      return;
-    }
-
-    setIsUpdatingDepts(true);
-    try {
-      const actor = user?.displayName || '担当者';
-      const noteText = `担当部署を「${prevLabel}」から「${nextLabel}」へ更新しました`;
-      const entry: TaskHistoryItem = {
-        id: `${Date.now()}_tr_${Math.random().toString(36).slice(2, 6)}`,
-        type: 'transfer',
-        text: noteText,
-        actorName: actor,
-        actorEmail: (user?.email || '').toLowerCase(),
-        createdAtLabel: getNowFullLabel(),
-      };
-
-      await updateDoc(doc(db, 'tasks', task.id), {
-        recommendedDept: nextLabel,
-        recommendedDepts: nextDepts,
-        adminComment: noteText,
-        history: arrayUnion(entry),
-      });
-
-      // 新たに追加された部署の部長メール宛てに新規依頼通知
-      const addedManagerEmails = collectManagerEmailsForDepts(addedDepts);
-      const titleForMail =
-        task.priority === '急ぎ' ? `【急ぎ・担当追加】${task.title}` : `【担当追加】${task.title}`;
-
-      if (addedManagerEmails.length > 0) {
-        await Promise.all(
-          addedManagerEmails.map((email) =>
-            addDoc(collection(db, 'notifications'), {
-              targetEmail: email,
-              kind: 'new_task',
-              taskId: task.id,
-              taskTitle: titleForMail,
-              department: nextLabel,
-              newStatus: task.status,
-              actorName: `${actor}（担当部署を更新）`,
-              read: false,
-              createdAt: serverTimestamp(),
-            })
-          )
-        );
-      }
-
-      // 依頼者にも担当変更をお知らせ
-      const requesterEmail = (task.creatorEmail || '').trim().toLowerCase();
-      if (requesterEmail && !addedManagerEmails.includes(requesterEmail)) {
-        await addDoc(collection(db, 'notifications'), {
-          targetUid: task.createdBy || '',
-          targetEmail: requesterEmail,
-          kind: 'status_update',
-          taskId: task.id,
-          taskTitle: task.title,
-          department: nextLabel,
-          newStatus: task.status,
-          comment: noteText,
-          actorName: actor,
-          read: false,
-          createdAt: serverTimestamp(),
-        });
-      }
-
-      alert(
-        `✅ 担当部署を「${nextLabel}」へ更新しました！` +
-          (addedManagerEmails.length > 0
-            ? `\n（追加部署の担当メール: ${addedManagerEmails.join(', ')} へ通知を送信します）`
-            : '')
-      );
-    } catch {
-      alert('担当部署の更新に失敗しました。');
-    } finally {
-      setIsUpdatingDepts(false);
-    }
-  };
-
-  const handleAddModalComment = async (task: Task) => {
+  const handleAddActionComment = async (item: ActionItem) => {
     const text = modalCommentText.trim();
     if (!text || isPostingComment) return;
-
     setIsPostingComment(true);
     try {
-      const actor = user?.displayName || '担当者';
-      const entry: TaskHistoryItem = {
-        id: `${Date.now()}_c_${Math.random().toString(36).slice(2, 6)}`,
+      const entry: ActionHistoryItem = {
+        id: `${Date.now()}_cm`,
         type: 'comment',
         text,
-        actorName: actor,
-        actorEmail: (user?.email || '').toLowerCase(),
+        actorName: user?.displayName || '担当者',
         createdAtLabel: getNowFullLabel(),
       };
-
-      await updateDoc(doc(db, 'tasks', task.id), {
-        adminComment: text,
+      await updateDoc(doc(db, 'oneOnOneActions', item.id), {
         history: arrayUnion(entry),
       });
-
-      const taskDepts = getTaskDepts(task);
-      const deptDisplay = taskDepts.join('・') || '担当部署';
-      const requesterEmail = (task.creatorEmail || '').trim().toLowerCase();
-      const managerEmails = collectManagerEmailsForDepts(taskDepts);
-      const recipientEmails = Array.from(
-        new Set([requesterEmail, ...managerEmails].filter(Boolean))
-      );
-
-      if (recipientEmails.length > 0) {
-        await Promise.all(
-          recipientEmails.map((email) =>
-            addDoc(collection(db, 'notifications'), {
-              targetUid: email === requesterEmail ? task.createdBy || '' : '',
-              targetEmail: email,
-              kind: 'status_update',
-              taskId: task.id,
-              taskTitle: task.title,
-              department: deptDisplay,
-              newStatus: task.status,
-              comment: text,
-              actorName: actor,
-              read: false,
-              createdAt: serverTimestamp(),
-            })
-          )
-        );
-      }
-
       setModalCommentText('');
-    } catch {
-      alert('コメントの投稿に失敗しました。');
     } finally {
       setIsPostingComment(false);
     }
   };
 
-  const handleDeleteTask = async (task: Task) => {
-    if (!confirm(`依頼「${task.title}」を削除しますか？この操作は取り消せません。`)) return;
+  const handleDeleteLog = async (log: OneOnOneLog) => {
+    if (!confirm(`${log.meetingDate} の「${log.memberName}」の1on1ログを削除しますか？`)) return;
+    await deleteDoc(doc(db, 'oneOnOneLogs', log.id));
+    if (selectedLogId === log.id) setSelectedLogId(null);
+  };
+
+  const handleDeleteAction = async (item: ActionItem) => {
+    if (!confirm(`課題「${item.title}」を削除しますか？`)) return;
+    await deleteDoc(doc(db, 'oneOnOneActions', item.id));
+    if (selectedActionId === item.id) setSelectedActionId(null);
+  };
+
+  // 部員マスタ追加・スプレッドシート一括取り込み
+  const handleAddMember = async () => {
+    if (!newMemberName.trim() || !newMemberEmail.trim() || !newMemberDept.trim()) {
+      alert('氏名・メールアドレス・部署を入力してください。');
+      return;
+    }
+    await addDoc(collection(db, 'members'), {
+      name: newMemberName.trim(),
+      email: newMemberEmail.trim().toLowerCase(),
+      department: newMemberDept.trim(),
+      role: newMemberRole,
+      managerEmail: (user?.email || '').toLowerCase(),
+    });
+    setNewMemberName('');
+    setNewMemberEmail('');
+    setNewMemberDept('');
+  };
+
+  const handleBulkImportMembers = async () => {
+    const lines = bulkPasteText
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+    if (lines.length === 0) return;
+
+    setIsBulkImporting(true);
     try {
-      await deleteDoc(doc(db, 'tasks', task.id));
-      if (selectedTaskId === task.id) {
-        setSelectedTaskId(null);
+      const existingEmails = new Set(members.map((m) => m.email.toLowerCase()));
+      let addedCount = 0;
+
+      for (const line of lines) {
+        const cols = line.split(/[\t,]+/).map((c) => c.trim());
+        const emailCol = cols.find((c) => c.includes('@'));
+        if (!emailCol) continue; // ヘッダー行などはスキップ
+        const email = emailCol.toLowerCase();
+        if (existingEmails.has(email)) continue;
+
+        const nonEmailCols = cols.filter((c) => c !== emailCol);
+        const name = nonEmailCols[0] || email.split('@')[0];
+        const department = nonEmailCols[1] || '未分類';
+        const role: MemberRole = nonEmailCols[2]?.includes('部長') ? '部長' : '部員';
+
+        await addDoc(collection(db, 'members'), {
+          name,
+          email,
+          department,
+          role,
+          managerEmail: (user?.email || '').toLowerCase(),
+        });
+        existingEmails.add(email);
+        addedCount++;
       }
+
+      setBulkPasteText('');
+      alert(`✅ ${addedCount}名の部員データを一括登録しました！`);
     } catch {
-      alert('削除に失敗しました。');
+      alert('一括取り込み中にエラーが発生しました。');
+    } finally {
+      setIsBulkImporting(false);
     }
-  };
-
-  const handleMarkAllRead = async (list: AppNotification[]) => {
-    const unread = list.filter((n) => !n.read);
-    await Promise.all(
-      unread.map((n) => updateDoc(doc(db, 'notifications', n.id), { read: true }))
-    );
-  };
-
-  const handleAddDepartment = async () => {
-    if (!newDeptName.trim() || !newDeptExpertise.trim()) return;
-    await addDoc(collection(db, 'departments'), {
-      name: newDeptName.trim(),
-      expertise: newDeptExpertise.trim(),
-      managerEmail: parseEmails(newDeptEmail).join(', '),
-    });
-    setNewDeptName('');
-    setNewDeptExpertise('');
-    setNewDeptEmail('');
-  };
-
-  const handleSaveDeptDetails = async (dept: Department) => {
-    const nextExpertise = (deptExpertiseDrafts[dept.id] ?? dept.expertise).trim();
-    if (!nextExpertise) {
-      alert('得意分野を入力してください。');
-      return;
-    }
-    const rawEmail = deptEmailDrafts[dept.id] ?? dept.managerEmail ?? '';
-    const cleanedEmail = parseEmails(rawEmail).join(', ');
-
-    await updateDoc(doc(db, 'departments', dept.id), {
-      expertise: nextExpertise,
-      managerEmail: cleanedEmail,
-    });
-
-    setDeptExpertiseDrafts((prev) => ({ ...prev, [dept.id]: nextExpertise }));
-    setDeptEmailDrafts((prev) => ({ ...prev, [dept.id]: cleanedEmail }));
-    alert(`✅ 「${dept.name}」の得意分野・担当メールを保存しました！`);
-  };
-
-  const syncBulkSelectionForEmail = (emailStr: string) => {
-    setBulkEmail(emailStr);
-    const target = emailStr.trim().toLowerCase();
-    if (!target || !target.includes('@')) {
-      setBulkDeptIds([]);
-      return;
-    }
-    const matchedIds = departments
-      .filter((d) => parseEmails(d.managerEmail).includes(target))
-      .map((d) => d.id);
-    setBulkDeptIds(matchedIds);
-  };
-
-  const toggleBulkDept = (deptId: string) => {
-    setBulkDeptIds((prev) =>
-      prev.includes(deptId) ? prev.filter((id) => id !== deptId) : [...prev, deptId]
-    );
-  };
-
-  const handleSaveBulkAssignment = async () => {
-    const targetEmail = bulkEmail.trim().toLowerCase();
-    if (!targetEmail || !targetEmail.includes('@')) {
-      alert('有効なメールアドレスを入力してください。');
-      return;
-    }
-
-    await Promise.all(
-      departments.map(async (dept) => {
-        const currentList = parseEmails(dept.managerEmail);
-        const isChecked = bulkDeptIds.includes(dept.id);
-        let nextList = currentList;
-
-        if (isChecked && !currentList.includes(targetEmail)) {
-          nextList = [...currentList, targetEmail];
-        } else if (!isChecked && currentList.includes(targetEmail)) {
-          nextList = currentList.filter((e) => e !== targetEmail);
-        } else {
-          return;
-        }
-
-        const joined = nextList.join(', ');
-        await updateDoc(doc(db, 'departments', dept.id), { managerEmail: joined });
-        setDeptEmailDrafts((prev) => ({ ...prev, [dept.id]: joined }));
-      })
-    );
-
-    alert(`✅ ${targetEmail} に ${bulkDeptIds.length}個の担当部署を紐づけました！`);
   };
 
   if (!user) {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-slate-900 via-blue-950 to-indigo-950 flex items-center justify-center p-6">
+      <div className="min-h-screen bg-gradient-to-br from-slate-900 via-emerald-950 to-teal-950 flex items-center justify-center p-6">
         <div className="bg-white/95 backdrop-blur-md p-10 rounded-3xl shadow-2xl border border-white/20 max-w-md w-full text-center">
-          <div className="w-16 h-16 bg-gradient-to-tr from-blue-600 to-indigo-500 rounded-2xl mx-auto mb-6 flex items-center justify-center shadow-lg shadow-blue-500/30 text-3xl">
-            ✨
+          <div className="w-16 h-16 bg-gradient-to-tr from-emerald-600 to-teal-500 rounded-2xl mx-auto mb-6 flex items-center justify-center shadow-lg shadow-emerald-500/30 text-3xl">
+            🤝
           </div>
           <h1 className="text-3xl font-black tracking-tight text-slate-900 mb-2">
-            Task-AI
+            1on1 Log AI
           </h1>
           <p className="text-slate-500 text-sm mb-8 leading-relaxed">
-            「誰に聞けばいい？」をAIが一瞬で解決。<br />
-            社内ヘルプデスク＆タスク管理プラットフォーム
+            リアルタイム文字起こし＆AI要約で1on1を資産に。<br />
+            記録した部長と本人だけのセキュアな面談管理
           </p>
           <button
             onClick={handleLogin}
@@ -1068,329 +732,185 @@ ${conversationHistory}`;
   }
 
   const userEmail = (user.email || '').toLowerCase();
-  const selectedTask = tasks.find((t) => t.id === selectedTaskId) || null;
-  const selectedTaskDepts = selectedTask ? getTaskDepts(selectedTask) : [];
 
-  const myAssignedDepts = departments.filter((d) =>
-    parseEmails(d.managerEmail).includes(userEmail)
+  // ★プライバシー制御：記録した部長本人 または 対象部員本人 のデータのみ抽出
+  const visibleLogs = logs.filter(
+    (l) =>
+      l.managerEmail.toLowerCase() === userEmail || l.memberEmail.toLowerCase() === userEmail
   );
-  const myAssignedDeptNames = myAssignedDepts.map((d) => d.name);
-
-  const myTasks = tasks.filter(
-    (t) =>
-      t.createdBy === user.uid ||
-      (userEmail && (t.creatorEmail || '').toLowerCase() === userEmail)
+  const visibleActions = actions.filter(
+    (a) =>
+      a.managerEmail.toLowerCase() === userEmail || a.memberEmail.toLowerCase() === userEmail
   );
-  const filteredMyTasks = myTasks.filter((t) => matchesSearchQuery(t, mypageSearchQuery));
-  const myPending = myTasks.filter((t) => t.status === '未処理').length;
-  const myInProgress = myTasks.filter((t) => t.status === '対応中').length;
-  const myCompleted = myTasks.filter((t) => t.status === '完了').length;
 
-  // 複数部署のどれか1つでも自分の担当部署に含まれていれば表示
-  const allAssignedTasks = tasks.filter((t) =>
-    getTaskDepts(t).some((deptName) => myAssignedDeptNames.includes(deptName))
-  );
-  const myDeptActiveCount = allAssignedTasks.filter((t) => t.status !== '完了').length;
-  const displayedAssignedTasks = (
-    myDeptFilter === 'すべて'
-      ? allAssignedTasks
-      : allAssignedTasks.filter((t) => getTaskDepts(t).includes(myDeptFilter))
-  )
-    .filter((t) => matchesSearchQuery(t, mypageSearchQuery))
-    .sort((a, b) => Number(b.priority === '急ぎ') - Number(a.priority === '急ぎ'));
-
-  const myNotifications = notifications.filter((n) => {
-    const tEmail = (n.targetEmail || '').toLowerCase();
-    if (tEmail && userEmail) return tEmail === userEmail;
-    return Boolean(n.targetUid && n.targetUid === user.uid);
-  });
-  const unreadNotifications = myNotifications.filter((n) => !n.read);
-
-  // 全体管理ボードの絞り込み（複数部署対応 × 急ぎのみ × キーワード検索）
-  const filteredBoardTasks = tasks.filter((t) => {
-    if (deptFilter !== 'すべて' && !getTaskDepts(t).includes(deptFilter)) return false;
-    if (boardUrgentOnly && t.priority !== '急ぎ') return false;
-    return matchesSearchQuery(t, boardSearchQuery);
-  });
-
-  const urgentActiveCount = tasks.filter(
-    (t) => t.priority === '急ぎ' && t.status !== '完了'
-  ).length;
-
-  const totalCount = tasks.length;
-  const pendingCount = tasks.filter((t) => t.status === '未処理').length;
-  const inProgressCount = tasks.filter((t) => t.status === '対応中').length;
-  const completedCount = tasks.filter((t) => t.status === '完了').length;
-  const completionRate = totalCount > 0 ? Math.round((completedCount / totalCount) * 100) : 0;
-
-  // 分析ダッシュボードの部署別集計（複数部署関与タスクも各部署にカウント）
-  const deptNames = Array.from(
+  // 部署リスト
+  const allDepartments = Array.from(
     new Set([
-      ...departments.map((d) => d.name),
-      ...tasks.flatMap((t) => {
-        const list = getTaskDepts(t);
-        return list.length > 0 ? list : ['未分類'];
-      }),
+      ...members.map((m) => m.department),
+      ...visibleLogs.map((l) => l.department),
     ])
   ).filter(Boolean);
 
-  const deptStats = deptNames
-    .map((name) => {
-      const dTasks = tasks.filter((t) => {
-        const list = getTaskDepts(t);
-        if (list.length === 0) return name === '未分類';
-        return list.includes(name);
-      });
-      return {
-        name,
-        total: dTasks.length,
-        pending: dTasks.filter((t) => t.status === '未処理').length,
-        inProgress: dTasks.filter((t) => t.status === '対応中').length,
-        completed: dTasks.filter((t) => t.status === '完了').length,
-      };
-    })
-    .sort((a, b) => b.total - a.total);
+  // 今月の実施状況集計
+  const monthLogs = visibleLogs.filter((l) => (l.meetingDate || '').startsWith(selectedMonth));
+  const doneMemberEmailsThisMonth = new Set(monthLogs.map((l) => l.memberEmail.toLowerCase()));
 
-  const maxDeptCount = Math.max(...deptStats.map((d) => d.total), 1);
-  const topDeptName = deptStats[0]?.total > 0 ? deptStats[0].name : 'データなし';
+  const filteredMembers = members.filter(
+    (m) => overviewDeptFilter === 'すべて' || m.department === overviewDeptFilter
+  );
 
-  const dailyStats = Array.from({ length: 7 }, (_, i) => {
-    const d = new Date();
-    d.setDate(d.getDate() - (6 - i));
-    const key = `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
-    const label = `${d.getMonth() + 1}/${d.getDate()}`;
-    const count = tasks.filter((t) => {
-      const td = getTaskDate(t.createdAt);
-      return `${td.getFullYear()}-${td.getMonth() + 1}-${td.getDate()}` === key;
-    }).length;
-    return { label, count };
+  const filteredLogs = visibleLogs.filter((l) => {
+    if (overviewDeptFilter !== 'すべて' && l.department !== overviewDeptFilter) return false;
+    const q = overviewSearch.trim().toLowerCase();
+    if (!q) return true;
+    const hay = [
+      l.memberName,
+      l.department,
+      l.rawMemo,
+      l.aiSummary?.overview || '',
+      l.aiSummary?.issues || '',
+      l.aiSummary?.direction || '',
+      l.transcript,
+    ]
+      .join(' ')
+      .toLowerCase();
+    return hay.includes(q);
   });
-  const maxDailyCount = Math.max(...dailyStats.map((d) => d.count), 1);
 
-  const tagCounts: Record<string, number> = {};
-  tasks.forEach((t) => {
-    (t.tags || []).forEach((tag) => {
-      tagCounts[tag] = (tagCounts[tag] || 0) + 1;
-    });
+  const filteredBoardActions = visibleActions.filter((a) => {
+    if (boardDeptFilter !== 'すべて' && a.department !== boardDeptFilter) return false;
+    if (boardUrgentOnly && a.priority !== '急ぎ') return false;
+    const q = boardSearch.trim().toLowerCase();
+    if (!q) return true;
+    const hay = [
+      a.title,
+      a.detail,
+      a.memberName,
+      a.department,
+      ...(a.history || []).map((h) => h.text),
+    ]
+      .join(' ')
+      .toLowerCase();
+    return hay.includes(q);
   });
-  const topTags = Object.entries(tagCounts)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 10);
 
-  const statusConfig = [
+  const activeActionCount = visibleActions.filter((a) => a.status !== '完了').length;
+  const highRiskCount = visibleLogs.filter((l) => l.aiSummary?.riskLevel === '高リスク').length;
+
+  const selectedLog = visibleLogs.find((l) => l.id === selectedLogId) || null;
+  const selectedAction = visibleActions.find((a) => a.id === selectedActionId) || null;
+
+  const boardColumns: {
+    key: ActionStatus;
+    label: string;
+    dot: string;
+    badge: string;
+    bg: string;
+  }[] = [
     {
-      key: '未処理' as const,
-      label: '未処理',
+      key: '未着手',
+      label: '未着手',
       dot: 'bg-blue-500',
       badge: 'bg-blue-100 text-blue-700',
-      columnBg: 'bg-slate-100/80',
+      bg: 'bg-slate-100/80',
     },
     {
-      key: '対応中' as const,
+      key: '対応中',
       label: '対応中',
       dot: 'bg-amber-500',
       badge: 'bg-amber-100 text-amber-700',
-      columnBg: 'bg-amber-50/40',
+      bg: 'bg-amber-50/40',
     },
     {
-      key: '完了' as const,
+      key: '完了',
       label: '完了',
       dot: 'bg-emerald-500',
       badge: 'bg-emerald-100 text-emerald-700',
-      columnBg: 'bg-emerald-50/40',
+      bg: 'bg-emerald-50/40',
     },
   ];
 
-  const modalHistoryList: TaskHistoryItem[] = (() => {
-    if (!selectedTask) return [];
-    if (selectedTask.history && selectedTask.history.length > 0) {
-      return selectedTask.history;
-    }
-    const fallback: TaskHistoryItem[] = [
-      {
-        id: 'legacy_init',
-        type: 'comment',
-        text: `依頼が登録されました：${selectedTask.title}`,
-        actorName: selectedTask.creatorName || '社員',
-        createdAtLabel: formatTimestamp(selectedTask.createdAt),
-      },
-    ];
-    if (selectedTask.adminComment) {
-      fallback.push({
-        id: 'legacy_memo',
-        type: 'comment',
-        text: selectedTask.adminComment,
-        actorName: '担当者',
-        createdAtLabel: '最新',
-      });
-    }
-    return fallback;
-  })();
-
-  // モーダルで選択可能な全部署リスト（登録済み部署＋カード固有の部署名）
-  const modalSelectableDeptNames = Array.from(
-    new Set([...departments.map((d) => d.name), ...selectedTaskDepts])
-  );
+  const riskBadgeStyle = (level?: RiskLevel) => {
+    if (level === '高リスク') return 'bg-rose-100 text-rose-700 border-rose-200';
+    if (level === '要注意') return 'bg-amber-100 text-amber-700 border-amber-200';
+    return 'bg-emerald-50 text-emerald-700 border-emerald-200';
+  };
 
   return (
     <div className="min-h-screen bg-slate-50 font-sans text-slate-800 flex flex-col">
       {/* ヘッダー */}
       <header className="bg-white/90 backdrop-blur-md border-b border-slate-200/80 px-4 md:px-8 py-3.5 flex flex-wrap items-center justify-between gap-4 sticky top-0 z-30">
         <div className="flex items-center gap-2.5">
-          <div className="w-9 h-9 bg-gradient-to-tr from-blue-600 to-indigo-500 rounded-xl flex items-center justify-center text-white font-black shadow-sm">
-            T
+          <div className="w-9 h-9 bg-gradient-to-tr from-emerald-600 to-teal-500 rounded-xl flex items-center justify-center text-white font-black shadow-sm">
+            1
           </div>
-          <span className="text-xl font-black tracking-tight bg-gradient-to-r from-blue-600 to-indigo-600 bg-clip-text text-transparent">
-            Task-AI
-          </span>
+          <div>
+            <span className="text-lg font-black tracking-tight bg-gradient-to-r from-emerald-700 to-teal-600 bg-clip-text text-transparent block leading-none">
+              1on1 Log AI
+            </span>
+            <span className="text-[10px] text-slate-400 font-bold">
+              🔒 部長・本人限定ログ
+            </span>
+          </div>
         </div>
 
-        <nav className="flex gap-1 bg-slate-100 p-1 rounded-xl">
+        <nav className="flex flex-wrap gap-1 bg-slate-100 p-1 rounded-xl">
           <button
-            onClick={() => setActiveTab('chat')}
-            className={`px-4 py-2 rounded-lg font-bold text-xs md:text-sm transition-all ${
-              activeTab === 'chat'
-                ? 'bg-white text-blue-600 shadow-sm'
+            onClick={() => setActiveTab('overview')}
+            className={`px-3.5 py-2 rounded-lg font-bold text-xs md:text-sm transition-all ${
+              activeTab === 'overview'
+                ? 'bg-white text-emerald-700 shadow-sm'
                 : 'text-slate-500 hover:text-slate-800'
             }`}
           >
-            💬 AIに相談
+            📊 実施状況＆ログ
           </button>
           <button
-            onClick={() => setActiveTab('mypage')}
-            className={`px-4 py-2 rounded-lg font-bold text-xs md:text-sm transition-all flex items-center gap-1.5 ${
-              activeTab === 'mypage'
-                ? 'bg-white text-blue-600 shadow-sm'
+            onClick={() => setActiveTab('record')}
+            className={`px-3.5 py-2 rounded-lg font-bold text-xs md:text-sm transition-all ${
+              activeTab === 'record'
+                ? 'bg-white text-emerald-700 shadow-sm'
                 : 'text-slate-500 hover:text-slate-800'
             }`}
           >
-            👤 マイページ
-            {myPending + myInProgress + myDeptActiveCount > 0 && (
-              <span className="bg-blue-600 text-white text-[10px] px-1.5 py-0.5 rounded-full">
-                {myPending + myInProgress + myDeptActiveCount}
+            🎙️ 1on1を記録
+          </button>
+          <button
+            onClick={() => setActiveTab('board')}
+            className={`px-3.5 py-2 rounded-lg font-bold text-xs md:text-sm transition-all flex items-center gap-1.5 ${
+              activeTab === 'board'
+                ? 'bg-white text-emerald-700 shadow-sm'
+                : 'text-slate-500 hover:text-slate-800'
+            }`}
+          >
+            📋 課題ボード
+            {activeActionCount > 0 && (
+              <span className="bg-emerald-600 text-white text-[10px] px-1.5 py-0.5 rounded-full">
+                {activeActionCount}
               </span>
             )}
           </button>
           <button
-            onClick={() => setActiveTab('admin')}
-            className={`px-4 py-2 rounded-lg font-bold text-xs md:text-sm transition-all flex items-center gap-1.5 ${
-              activeTab === 'admin'
-                ? 'bg-white text-blue-600 shadow-sm'
+            onClick={() => setActiveTab('members')}
+            className={`px-3.5 py-2 rounded-lg font-bold text-xs md:text-sm transition-all ${
+              activeTab === 'members'
+                ? 'bg-white text-emerald-700 shadow-sm'
                 : 'text-slate-500 hover:text-slate-800'
             }`}
           >
-            📋 全体管理
-            {urgentActiveCount > 0 && (
-              <span className="bg-rose-500 text-white text-[10px] px-1.5 py-0.5 rounded-full">
-                🔥{urgentActiveCount}
-              </span>
-            )}
+            👥 部員マスタ
           </button>
         </nav>
 
-        <div className="flex items-center gap-3 relative">
-          <button
-            onClick={() => setShowNotifMenu((prev) => !prev)}
-            className="relative p-2 rounded-xl bg-slate-100 hover:bg-slate-200/80 text-slate-700 transition-colors"
-            title="通知一覧"
-          >
-            🔔
-            {unreadNotifications.length > 0 && (
-              <span className="absolute -top-1 -right-1 bg-rose-500 text-white text-[10px] font-black w-5 h-5 rounded-full flex items-center justify-center shadow">
-                {unreadNotifications.length}
-              </span>
-            )}
-          </button>
-
-          {showNotifMenu && (
-            <div className="absolute right-0 top-12 w-80 sm:w-96 bg-white rounded-2xl shadow-2xl border border-slate-200 z-50 overflow-hidden">
-              <div className="px-4 py-3 bg-slate-50 border-b border-slate-100 flex items-center justify-between">
-                <span className="font-bold text-sm text-slate-800">
-                  🔔 お知らせ（{unreadNotifications.length}件未読）
-                </span>
-                {unreadNotifications.length > 0 && (
-                  <button
-                    onClick={() => handleMarkAllRead(myNotifications)}
-                    className="text-xs text-blue-600 font-bold hover:underline"
-                  >
-                    すべて既読
-                  </button>
-                )}
-              </div>
-              <div className="max-h-80 overflow-y-auto divide-y divide-slate-100">
-                {myNotifications.length === 0 ? (
-                  <p className="text-xs text-slate-400 text-center py-8">
-                    まだ通知はありません
-                  </p>
-                ) : (
-                  myNotifications.slice(0, 20).map((n) => (
-                    <div
-                      key={n.id}
-                      onClick={async () => {
-                        if (!n.read) {
-                          await updateDoc(doc(db, 'notifications', n.id), { read: true });
-                        }
-                        setShowNotifMenu(false);
-                        const found = tasks.find((t) => t.id === n.taskId);
-                        if (found) {
-                          openTaskModal(found);
-                        } else {
-                          setActiveTab('mypage');
-                          setMypageView(n.kind === 'new_task' ? 'assigned' : 'requested');
-                        }
-                      }}
-                      className={`p-3.5 cursor-pointer hover:bg-slate-50 transition-colors ${
-                        !n.read ? 'bg-blue-50/40' : ''
-                      }`}
-                    >
-                      <div className="flex items-center justify-between gap-2 mb-1">
-                        {n.kind === 'new_task' ? (
-                          <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-700">
-                            📥 新規依頼（{n.department}）
-                          </span>
-                        ) : (
-                          <span
-                            className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
-                              n.newStatus === '完了'
-                                ? 'bg-emerald-100 text-emerald-700'
-                                : n.newStatus === '対応中'
-                                ? 'bg-amber-100 text-amber-700'
-                                : 'bg-blue-100 text-blue-700'
-                            }`}
-                          >
-                            進捗：{n.newStatus}
-                          </span>
-                        )}
-                        <span className="text-[10px] text-slate-400">
-                          {formatTimestamp(n.createdAt)}
-                        </span>
-                      </div>
-                      <p className="text-xs font-bold text-slate-800">「{n.taskTitle}」</p>
-                      <p className="text-[11px] text-slate-500 mt-0.5">
-                        {n.kind === 'new_task'
-                          ? `${n.actorName} さんから相談が届きました`
-                          : `${n.department}（${n.actorName}）がステータスを更新しました`}
-                      </p>
-                      {n.comment && (
-                        <p className="text-xs bg-slate-100 text-slate-700 p-2 rounded-lg mt-1.5">
-                          💬 {n.comment}
-                        </p>
-                      )}
-                    </div>
-                  ))
-                )}
-              </div>
-            </div>
-          )}
-
+        <div className="flex items-center gap-3">
           {user.photoURL ? (
             <img
               src={user.photoURL}
-              alt="icon"
+              alt=""
               className="w-8 h-8 rounded-full ring-2 ring-slate-100"
             />
           ) : (
-            <div className="w-8 h-8 rounded-full bg-blue-100 text-blue-700 font-bold flex items-center justify-center text-xs">
+            <div className="w-8 h-8 rounded-full bg-emerald-100 text-emerald-700 font-bold flex items-center justify-center text-xs">
               {user.displayName?.[0] || 'U'}
             </div>
           )}
@@ -1400,1605 +920,1114 @@ ${conversationHistory}`;
           </div>
           <button
             onClick={handleLogout}
-            className="text-xs text-slate-400 hover:text-slate-600 border border-slate-200 px-2.5 py-1 rounded-lg transition-colors"
+            className="text-xs text-slate-400 hover:text-slate-600 border border-slate-200 px-2.5 py-1 rounded-lg"
           >
             ログアウト
           </button>
         </div>
       </header>
 
-      <main className="flex-1 p-4 md:p-8" onClick={() => showNotifMenu && setShowNotifMenu(false)}>
+      <main className="flex-1 p-4 md:p-8 max-w-7xl w-full mx-auto">
         {/* =========================================
-            【1】AIチャット画面
+            【1】実施状況＆1on1ログ一覧
         ========================================= */}
-        {activeTab === 'chat' && (
-          <div className="max-w-3xl mx-auto bg-white rounded-3xl shadow-sm border border-slate-200/80 flex flex-col h-[78vh] overflow-hidden">
-            <div className="px-6 py-4 bg-gradient-to-r from-blue-600 to-indigo-600 text-white flex items-center justify-between">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 bg-white/20 backdrop-blur rounded-2xl flex items-center justify-center text-xl">
-                  🤖
-                </div>
-                <div>
-                  <h2 className="font-bold text-sm md:text-base">社内お困りごと案内AI</h2>
-                  <p className="text-[11px] text-blue-100 flex items-center gap-1.5">
-                    <span className="w-2 h-2 bg-emerald-400 rounded-full animate-pulse"></span>
-                    オンライン・登録部署 {departments.length}件から最適判定（複数部署連携対応）
-                  </p>
-                </div>
+        {activeTab === 'overview' && (
+          <div className="space-y-6">
+            <div className="flex flex-wrap items-center justify-between gap-4">
+              <div>
+                <h2 className="text-2xl font-black text-slate-900">実施状況＆1on1ログ</h2>
+                <p className="text-xs md:text-sm text-slate-500">
+                  あなた（{user.email}）が記録した面談、またはあなた自身の面談ログのみ表示されています
+                </p>
               </div>
               <button
-                onClick={() =>
-                  setMessages([
-                    {
-                      role: 'ai',
-                      text: '会話をリセットしました！新しいご相談をどうぞ。',
-                      time: getNowTime(),
-                    },
-                  ])
-                }
-                className="text-xs bg-white/15 hover:bg-white/25 text-white px-3 py-1.5 rounded-xl transition-colors"
+                onClick={() => setActiveTab('record')}
+                className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs md:text-sm font-bold px-5 py-2.5 rounded-xl shadow-sm transition-all"
               >
-                リセット
+                🎙️ 新しい1on1を記録する
               </button>
             </div>
 
-            <div className="flex-1 overflow-y-auto p-5 md:p-6 space-y-6 bg-slate-50/70">
-              {departments.length === 0 && (
-                <div className="bg-amber-50 text-amber-800 p-4 rounded-2xl text-xs md:text-sm border border-amber-200 flex items-center justify-between gap-3">
-                  <span>⚠️ 先に「全体管理 ＞ 部署・メール管理」から部署を登録してください。</span>
+            {/* KPIサマリー */}
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+              <div className="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-sm">
+                <span className="text-xs font-bold text-slate-400">対象月の実施数</span>
+                <p className="text-3xl font-black text-emerald-600 mt-1">
+                  {monthLogs.length}
+                  <span className="text-xs font-normal text-slate-400 ml-1">件</span>
+                </p>
+              </div>
+              <div className="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-sm">
+                <span className="text-xs font-bold text-slate-400">累計ログ（閲覧権限内）</span>
+                <p className="text-3xl font-black text-slate-900 mt-1">
+                  {visibleLogs.length}
+                  <span className="text-xs font-normal text-slate-400 ml-1">件</span>
+                </p>
+              </div>
+              <div className="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-sm">
+                <span className="text-xs font-bold text-slate-400">未完了ネクストアクション</span>
+                <p className="text-3xl font-black text-amber-500 mt-1">
+                  {activeActionCount}
+                  <span className="text-xs font-normal text-slate-400 ml-1">件</span>
+                </p>
+              </div>
+              <div className="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-sm">
+                <span className="text-xs font-bold text-slate-400">高リスク・要フォロー</span>
+                <p className="text-3xl font-black text-rose-600 mt-1">
+                  {highRiskCount}
+                  <span className="text-xs font-normal text-slate-400 ml-1">件</span>
+                </p>
+              </div>
+            </div>
+
+            {/* 月次実施チェックリスト（部員マスタ連動） */}
+            <div className="bg-white p-6 rounded-3xl border border-slate-200/80 shadow-sm space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="flex items-center gap-3">
+                  <h3 className="font-bold text-slate-900">📅 月次1on1 実施チェック</h3>
+                  <input
+                    type="month"
+                    value={selectedMonth}
+                    onChange={(e) => setSelectedMonth(e.target.value)}
+                    className="text-xs font-bold border border-slate-200 rounded-lg px-2.5 py-1.5 bg-slate-50 outline-none focus:border-emerald-500"
+                  />
+                </div>
+                <div className="flex flex-wrap gap-1.5">
                   <button
-                    onClick={() => {
-                      setActiveTab('admin');
-                      setAdminView('departments');
-                    }}
-                    className="bg-amber-600 text-white px-3 py-1.5 rounded-lg font-bold text-xs shrink-0"
+                    onClick={() => setOverviewDeptFilter('すべて')}
+                    className={`text-xs font-bold px-3 py-1 rounded-full ${
+                      overviewDeptFilter === 'すべて'
+                        ? 'bg-emerald-600 text-white'
+                        : 'bg-slate-100 text-slate-600'
+                    }`}
                   >
-                    登録へ移動
+                    すべて
+                  </button>
+                  {allDepartments.map((d) => (
+                    <button
+                      key={d}
+                      onClick={() => setOverviewDeptFilter(d)}
+                      className={`text-xs font-bold px-3 py-1 rounded-full ${
+                        overviewDeptFilter === d
+                          ? 'bg-emerald-600 text-white'
+                          : 'bg-slate-100 text-slate-600'
+                      }`}
+                    >
+                      {d}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {filteredMembers.length === 0 ? (
+                <div className="text-center py-6 bg-slate-50 rounded-2xl border border-dashed border-slate-200">
+                  <p className="text-xs text-slate-500 mb-2">
+                    まだ部員マスタが登録されていません。スプレッドシートから一括登録できます。
+                  </p>
+                  <button
+                    onClick={() => setActiveTab('members')}
+                    className="text-xs font-bold text-emerald-700 hover:underline"
+                  >
+                    👥 部員マスタを登録しに行く →
+                  </button>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                  {filteredMembers.map((m) => {
+                    const isDone = doneMemberEmailsThisMonth.has(m.email.toLowerCase());
+                    return (
+                      <div
+                        key={m.id}
+                        className={`p-3.5 rounded-2xl border flex items-center justify-between gap-2 ${
+                          isDone
+                            ? 'bg-emerald-50/50 border-emerald-200'
+                            : 'bg-white border-slate-200'
+                        }`}
+                      >
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-1.5">
+                            <span className="font-bold text-sm text-slate-900 truncate">
+                              {m.name}
+                            </span>
+                            <span className="text-[10px] bg-slate-100 text-slate-600 px-2 py-0.5 rounded-full shrink-0">
+                              {m.department}
+                            </span>
+                          </div>
+                          <p className="text-[11px] text-slate-400 truncate">{m.email}</p>
+                        </div>
+                        {isDone ? (
+                          <span className="text-[11px] font-bold bg-emerald-600 text-white px-2.5 py-1 rounded-lg shrink-0">
+                            ✓ 実施済
+                          </span>
+                        ) : (
+                          <button
+                            onClick={() => {
+                              setSelectedMemberId(m.id);
+                              setActiveTab('record');
+                            }}
+                            className="text-[11px] font-bold bg-slate-900 hover:bg-emerald-600 text-white px-2.5 py-1 rounded-lg shrink-0 transition-colors"
+                          >
+                            記録する →
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {/* 1on1ログ一覧 */}
+            <div className="bg-white p-6 rounded-3xl border border-slate-200/80 shadow-sm space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <h3 className="font-bold text-slate-900">
+                  🗂️ 1on1ログ履歴（{filteredLogs.length}件）
+                </h3>
+                <div className="relative w-full sm:w-72">
+                  <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 text-xs">
+                    🔍
+                  </span>
+                  <input
+                    type="text"
+                    value={overviewSearch}
+                    onChange={(e) => setOverviewSearch(e.target.value)}
+                    placeholder="氏名・課題・キーワードで検索..."
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl pl-8 pr-3 py-2 text-xs outline-none focus:bg-white focus:ring-2 focus:ring-emerald-500"
+                  />
+                </div>
+              </div>
+
+              {filteredLogs.length === 0 ? (
+                <div className="text-center py-14 border-2 border-dashed border-slate-100 rounded-2xl">
+                  <p className="text-3xl mb-2">📝</p>
+                  <p className="text-sm text-slate-500">まだ1on1ログがありません</p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {filteredLogs.map((log) => {
+                    const isManager = log.managerEmail.toLowerCase() === userEmail;
+                    return (
+                      <div
+                        key={log.id}
+                        onClick={() => setSelectedLogId(log.id)}
+                        className="cursor-pointer p-5 rounded-2xl border border-slate-200/80 hover:border-emerald-300 hover:bg-emerald-50/10 transition-all space-y-2.5"
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="font-black text-slate-900 text-base">
+                              👤 {log.memberName}
+                            </span>
+                            <span className="text-xs font-bold bg-slate-100 text-slate-600 px-2.5 py-0.5 rounded-full">
+                              {log.department}
+                            </span>
+                            <span
+                              className={`text-[11px] font-bold px-2.5 py-0.5 rounded-full border ${riskBadgeStyle(
+                                log.aiSummary?.riskLevel
+                              )}`}
+                            >
+                              {log.aiSummary?.riskLevel || '通常'}
+                            </span>
+                            {isManager && log.privateMemo && (
+                              <span className="text-[10px] font-bold bg-slate-800 text-white px-2 py-0.5 rounded-full">
+                                🔒 部長メモあり
+                              </span>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-3">
+                            <span className="text-xs font-bold text-slate-500">
+                              面談日：{log.meetingDate}
+                            </span>
+                            {isManager && (
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleDeleteLog(log);
+                                }}
+                                className="text-xs text-red-500 hover:bg-red-50 font-bold px-2 py-1 rounded-lg"
+                              >
+                                削除
+                              </button>
+                            )}
+                          </div>
+                        </div>
+
+                        <p className="text-sm text-slate-700 leading-relaxed">
+                          {log.aiSummary?.overview}
+                        </p>
+                        <div className="bg-slate-50 p-3 rounded-xl text-xs text-slate-600">
+                          <strong className="text-slate-800">現状の課題：</strong>
+                          {log.aiSummary?.issues}
+                        </div>
+                        <div className="flex items-center justify-between text-[11px] text-slate-400 pt-1">
+                          <span>面談担当：{log.managerName}</span>
+                          <span className="text-emerald-700 font-bold">詳細・文字起こしを見る →</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* =========================================
+            【2】1on1記録（リアルタイム録音 ＆ AI要約）
+        ========================================= */}
+        {activeTab === 'record' && (
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
+            {/* 左カラム：入力＆リアルタイム音声文字起こし */}
+            <div className="bg-white p-6 rounded-3xl border border-slate-200/80 shadow-sm space-y-5">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h2 className="text-xl font-black text-slate-900">🎙️ 1on1を記録する</h2>
+                  <p className="text-xs text-slate-500">
+                    リアルタイム録音または全文貼り付け＋ざっくりメモからAIが構造化します
+                  </p>
+                </div>
+              </div>
+
+              {/* 基本情報 */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs font-bold text-slate-600 block mb-1">面談日</label>
+                  <input
+                    type="date"
+                    value={meetingDate}
+                    onChange={(e) => setMeetingDate(e.target.value)}
+                    className="w-full border border-slate-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-emerald-500"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs font-bold text-slate-600 block mb-1">
+                    対象部員（マスタから選択）
+                  </label>
+                  <select
+                    value={selectedMemberId}
+                    onChange={(e) => setSelectedMemberId(e.target.value)}
+                    className="w-full border border-slate-200 rounded-xl px-3 py-2 text-sm bg-white outline-none focus:border-emerald-500"
+                  >
+                    <option value="">-- 直接入力する --</option>
+                    {members.map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.name}（{m.department}）
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              {!selectedMemberId && (
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 bg-slate-50 p-3.5 rounded-2xl border border-slate-200/70">
+                  <input
+                    type="text"
+                    placeholder="部員氏名（例：井上陽斗）"
+                    value={manualMemberName}
+                    onChange={(e) => setManualMemberName(e.target.value)}
+                    className="bg-white border border-slate-200 rounded-xl px-3 py-2 text-xs outline-none focus:border-emerald-500"
+                  />
+                  <input
+                    type="email"
+                    placeholder="部員メールアドレス"
+                    value={manualMemberEmail}
+                    onChange={(e) => setManualMemberEmail(e.target.value)}
+                    className="bg-white border border-slate-200 rounded-xl px-3 py-2 text-xs outline-none focus:border-emerald-500"
+                  />
+                  <input
+                    type="text"
+                    placeholder="部署名（例：営業部）"
+                    value={manualDepartment}
+                    onChange={(e) => setManualDepartment(e.target.value)}
+                    className="bg-white border border-slate-200 rounded-xl px-3 py-2 text-xs outline-none focus:border-emerald-500"
+                  />
+                </div>
+              )}
+
+              {/* ざっくりメモ（要約用） */}
+              <div>
+                <label className="text-xs font-bold text-slate-700 block mb-1">
+                  ✏️ ざっくりメモ（要点・AI要約のヒント）
+                </label>
+                <textarea
+                  rows={3}
+                  placeholder="例：転職希望あり。現在の担当業務と強みが合っていないと感じている。強みを活かせる配置転換も検討。"
+                  value={rawMemo}
+                  onChange={(e) => setRawMemo(e.target.value)}
+                  className="w-full border border-slate-200 rounded-2xl px-4 py-3 text-sm outline-none focus:ring-2 focus:ring-emerald-500"
+                />
+              </div>
+
+              {/* 部長専用非公開メモ */}
+              <div className="bg-slate-900/5 p-4 rounded-2xl border border-slate-200">
+                <label className="text-xs font-bold text-slate-800 flex items-center gap-1.5 mb-1">
+                  🔒 部長専用・非公開メモ（対象部員には表示されません）
+                </label>
+                <textarea
+                  rows={2}
+                  placeholder="例：何とか引き留めたい。来週中に人事部長へ配置転換の相談を入れる。"
+                  value={privateMemo}
+                  onChange={(e) => setPrivateMemo(e.target.value)}
+                  className="w-full bg-white border border-slate-200 rounded-xl px-3.5 py-2.5 text-xs outline-none focus:border-slate-500"
+                />
+              </div>
+
+              {/* リアルタイム音声文字起こし ＋ 全文貼り付け */}
+              <div className="space-y-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <label className="text-xs font-bold text-slate-700">
+                    🗣️ 会話ログ全文（リアルタイム録音 ／ テキスト貼り付け）
+                  </label>
+                  {!isRecording ? (
+                    <button
+                      type="button"
+                      onClick={handleStartRecording}
+                      className="bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold px-3.5 py-1.5 rounded-xl shadow-sm flex items-center gap-1.5 transition-all active:scale-95"
+                    >
+                      🎙️ 録音して文字起こし開始
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={handleStopRecording}
+                      className="bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold px-3.5 py-1.5 rounded-xl shadow-sm flex items-center gap-1.5 animate-pulse"
+                    >
+                      ⏹️ 録音を停止する
+                    </button>
+                  )}
+                </div>
+
+                {isRecording && (
+                  <div className="bg-rose-50 border border-rose-200 text-rose-800 text-xs p-3 rounded-xl flex items-center gap-2">
+                    <span className="w-2.5 h-2.5 bg-rose-500 rounded-full animate-ping shrink-0" />
+                    <span className="font-bold">聞き取り中...</span>
+                    <span className="text-rose-600 truncate">
+                      {interimText || 'マイクに向かって話してください（Chrome / Edge推奨）'}
+                    </span>
+                  </div>
+                )}
+
+                <textarea
+                  rows={7}
+                  placeholder="録音ボタンを押すとここに自動で文字起こしされます。Googleドキュメントの会話ログ全文をそのまま貼り付けることもできます。"
+                  value={transcript}
+                  onChange={(e) => setTranscript(e.target.value)}
+                  className="w-full border border-slate-200 rounded-2xl px-4 py-3 text-xs leading-relaxed outline-none focus:ring-2 focus:ring-emerald-500"
+                />
+
+                <input
+                  type="url"
+                  placeholder="元のGoogleドキュメントURL（任意・リンク保存用）"
+                  value={docUrl}
+                  onChange={(e) => setDocUrl(e.target.value)}
+                  className="w-full border border-slate-200 rounded-xl px-3.5 py-2 text-xs outline-none focus:border-emerald-500"
+                />
+              </div>
+
+              <button
+                type="button"
+                onClick={handleGenerateSummary}
+                disabled={isSummarizing}
+                className="w-full bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 disabled:opacity-50 text-white font-bold py-3.5 rounded-2xl shadow-md transition-all active:scale-98 text-sm"
+              >
+                {isSummarizing
+                  ? '🤖 要約とネクストアクションを作成中...'
+                  : '✨ AIで面談内容・課題を自動要約する'}
+              </button>
+            </div>
+
+            {/* 右カラム：AI出力プレビュー＆編集＆保存 */}
+            <div className="bg-white p-6 rounded-3xl border border-slate-200/80 shadow-sm space-y-5">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h3 className="text-lg font-black text-slate-900">📄 AI要約・課題プレビュー</h3>
+                  <p className="text-xs text-slate-500">
+                    出力内容は保存前に自由に手直しできます
+                  </p>
+                </div>
+                {summaryDraft && (
+                  <select
+                    value={summaryDraft.riskLevel}
+                    onChange={(e) =>
+                      setSummaryDraft({
+                        ...summaryDraft,
+                        riskLevel: e.target.value as RiskLevel,
+                      })
+                    }
+                    className={`text-xs font-bold px-3 py-1.5 rounded-xl border outline-none ${riskBadgeStyle(
+                      summaryDraft.riskLevel
+                    )}`}
+                  >
+                    <option value="通常">通常</option>
+                    <option value="要注意">要注意</option>
+                    <option value="高リスク">高リスク</option>
+                  </select>
+                )}
+              </div>
+
+              {!summaryDraft ? (
+                <div className="text-center py-20 border-2 border-dashed border-slate-200 rounded-2xl space-y-2">
+                  <p className="text-4xl">🤖</p>
+                  <p className="text-sm font-bold text-slate-600">
+                    左側のメモや文字起こしを入力して要約ボタンを押してください
+                  </p>
+                  <p className="text-xs text-slate-400">
+                    現状の課題・背景・解決の方向性・ネクストアクションが自動生成されます
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-4">
+                  <div>
+                    <label className="text-xs font-bold text-slate-500 block mb-1">面談概要</label>
+                    <textarea
+                      rows={2}
+                      value={summaryDraft.overview}
+                      onChange={(e) =>
+                        setSummaryDraft({ ...summaryDraft, overview: e.target.value })
+                      }
+                      className="w-full border border-slate-200 rounded-xl px-3.5 py-2.5 text-sm outline-none focus:border-emerald-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs font-bold text-slate-500 block mb-1">
+                      現状の課題
+                    </label>
+                    <textarea
+                      rows={2}
+                      value={summaryDraft.issues}
+                      onChange={(e) =>
+                        setSummaryDraft({ ...summaryDraft, issues: e.target.value })
+                      }
+                      className="w-full border border-slate-200 rounded-xl px-3.5 py-2.5 text-sm outline-none focus:border-emerald-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs font-bold text-slate-500 block mb-1">背景</label>
+                    <textarea
+                      rows={2}
+                      value={summaryDraft.background}
+                      onChange={(e) =>
+                        setSummaryDraft({ ...summaryDraft, background: e.target.value })
+                      }
+                      className="w-full border border-slate-200 rounded-xl px-3.5 py-2.5 text-sm outline-none focus:border-emerald-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs font-bold text-slate-500 block mb-1">
+                      解決に向けた方向性
+                    </label>
+                    <textarea
+                      rows={3}
+                      value={summaryDraft.direction}
+                      onChange={(e) =>
+                        setSummaryDraft({ ...summaryDraft, direction: e.target.value })
+                      }
+                      className="w-full border border-slate-200 rounded-xl px-3.5 py-2.5 text-sm outline-none focus:border-emerald-500"
+                    />
+                  </div>
+
+                  {/* ネクストアクション一覧（チェックしたものだけ課題ボードへ自動登録） */}
+                  <div className="bg-emerald-50/50 p-4 rounded-2xl border border-emerald-200/80 space-y-2.5">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-bold text-emerald-900">
+                        📋 ネクストアクション（チェックした項目を課題ボードへ登録）
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSummaryDraft({
+                            ...summaryDraft,
+                            nextActions: [...summaryDraft.nextActions, ''],
+                          });
+                          setSelectedActionsToCreate((prev) => [...prev, true]);
+                        }}
+                        className="text-xs font-bold text-emerald-700 hover:underline"
+                      >
+                        ＋ 追加
+                      </button>
+                    </div>
+                    {summaryDraft.nextActions.map((act, idx) => (
+                      <div key={idx} className="flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          checked={selectedActionsToCreate[idx] ?? true}
+                          onChange={(e) =>
+                            setSelectedActionsToCreate((prev) =>
+                              prev.map((v, i) => (i === idx ? e.target.checked : v))
+                            )
+                          }
+                          className="w-4 h-4 accent-emerald-600"
+                        />
+                        <input
+                          type="text"
+                          value={act}
+                          onChange={(e) => {
+                            const next = [...summaryDraft.nextActions];
+                            next[idx] = e.target.value;
+                            setSummaryDraft({ ...summaryDraft, nextActions: next });
+                          }}
+                          className="flex-1 bg-white border border-emerald-200 rounded-xl px-3 py-1.5 text-xs outline-none focus:border-emerald-500"
+                        />
+                      </div>
+                    ))}
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={handleSaveOneOnOne}
+                    disabled={isSavingLog}
+                    className="w-full bg-slate-900 hover:bg-slate-800 disabled:bg-slate-300 text-white font-bold py-3.5 rounded-2xl shadow-md text-sm transition-all"
+                  >
+                    {isSavingLog
+                      ? '保存中...'
+                      : '💾 1on1ログを保存＆課題をボードへ登録する'}
                   </button>
                 </div>
               )}
+            </div>
+          </div>
+        )}
 
-              {messages.map((msg, index) => (
-                <div
-                  key={index}
-                  className={`flex gap-3 ${msg.role === 'user' ? 'flex-row-reverse' : 'flex-row'}`}
+        {/* =========================================
+            【3】課題・アクションボード
+        ========================================= */}
+        {activeTab === 'board' && (
+          <div className="space-y-5">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h2 className="text-2xl font-black text-slate-900">📋 課題・アクションボード</h2>
+                <p className="text-xs text-slate-500">
+                  1on1から生まれたネクストアクションの進捗を管理（本人と部長のみ閲覧可能）
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="relative w-60">
+                  <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 text-xs">
+                    🔍
+                  </span>
+                  <input
+                    type="text"
+                    value={boardSearch}
+                    onChange={(e) => setBoardSearch(e.target.value)}
+                    placeholder="課題・部員名で検索..."
+                    className="w-full bg-white border border-slate-200 rounded-xl pl-8 pr-3 py-2 text-xs outline-none focus:ring-2 focus:ring-emerald-500"
+                  />
+                </div>
+                <button
+                  onClick={() => setBoardUrgentOnly((prev) => !prev)}
+                  className={`text-xs font-bold px-3.5 py-2 rounded-xl border ${
+                    boardUrgentOnly
+                      ? 'bg-rose-600 text-white border-rose-600'
+                      : 'bg-white text-rose-600 border-rose-200'
+                  }`}
                 >
-                  {msg.role === 'ai' ? (
-                    <div className="w-9 h-9 rounded-2xl bg-gradient-to-tr from-blue-600 to-indigo-500 text-white flex items-center justify-center text-base shrink-0 shadow-sm mt-1">
-                      🤖
-                    </div>
-                  ) : user.photoURL ? (
-                    <img
-                      src={user.photoURL}
-                      alt=""
-                      className="w-9 h-9 rounded-full shrink-0 border border-slate-200 mt-1"
-                    />
-                  ) : (
-                    <div className="w-9 h-9 rounded-full bg-blue-100 text-blue-700 font-bold flex items-center justify-center text-xs shrink-0 mt-1">
-                      {user.displayName?.[0] || 'U'}
-                    </div>
-                  )}
-
-                  <div
-                    className={`flex flex-col max-w-[82%] ${
-                      msg.role === 'user' ? 'items-end' : 'items-start'
-                    }`}
-                  >
-                    <div
-                      className={`px-4 py-3 rounded-2xl text-sm leading-relaxed whitespace-pre-wrap shadow-sm ${
-                        msg.role === 'user'
-                          ? 'bg-blue-600 text-white rounded-tr-sm'
-                          : msg.isError
-                          ? 'bg-amber-50 text-amber-900 border border-amber-200 rounded-tl-sm'
-                          : 'bg-white text-slate-800 border border-slate-200/80 rounded-tl-sm'
-                      }`}
-                    >
-                      {msg.text}
-                      {msg.isError && (
-                        <div className="mt-3 flex flex-wrap gap-2">
-                          <button
-                            onClick={handleRetry}
-                            disabled={isThinking}
-                            className="bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold px-3.5 py-2 rounded-xl shadow-sm transition-all active:scale-95"
-                          >
-                            🔄 もう一度AIで試す
-                          </button>
-                          <button
-                            onClick={handleUseFallback}
-                            disabled={isThinking}
-                            className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3.5 py-2 rounded-xl shadow-sm transition-all active:scale-95"
-                          >
-                            ⚡ バックアップ自動判定でカードを作る
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                    <span className="text-[10px] text-slate-400 mt-1 px-1">{msg.time}</span>
-
-                    {msg.proposal && (() => {
-                      const proposalDepts = getProposalDepts(msg.proposal);
-                      const selectableDepts = Array.from(
-                        new Set([...departments.map((d) => d.name), ...proposalDepts])
-                      );
-                      return (
-                        <div className="mt-3 w-full max-w-md bg-white border border-blue-200 rounded-2xl overflow-hidden shadow-md">
-                          <div className="bg-blue-50/80 px-4 py-3 border-b border-blue-100 space-y-2">
-                            <div className="flex items-center justify-between">
-                              <span className="text-xs font-extrabold text-blue-700">
-                                🎯 送信先部署（複数選択OK）
-                              </span>
-                              <span className="text-[11px] font-bold text-blue-600">
-                                {proposalDepts.length}部署選択中
-                              </span>
-                            </div>
-                            <div className="flex flex-wrap gap-1.5">
-                              {selectableDepts.map((deptName) => {
-                                const checked = proposalDepts.includes(deptName);
-                                return (
-                                  <button
-                                    key={deptName}
-                                    type="button"
-                                    disabled={msg.isSubmitted}
-                                    onClick={() => handleToggleProposalDept(index, deptName)}
-                                    className={`text-[11px] font-bold px-2.5 py-1 rounded-lg border transition-all flex items-center gap-1 ${
-                                      checked
-                                        ? 'bg-blue-600 text-white border-blue-600 shadow-2xs'
-                                        : 'bg-white text-slate-600 border-slate-200 hover:border-blue-300'
-                                    } disabled:opacity-70`}
-                                  >
-                                    <span>{checked ? '☑' : '☐'}</span>
-                                    {deptName}
-                                  </button>
-                                );
-                              })}
-                            </div>
-                          </div>
-
-                          <div className="p-4 space-y-3">
-                            <p className="text-xs text-blue-700 bg-blue-50/60 p-2.5 rounded-xl">
-                              💡 {msg.proposal.reason}
-                            </p>
-                            <div>
-                              <span className="text-[10px] font-bold text-slate-400 uppercase">
-                                依頼タイトル
-                              </span>
-                              <p className="font-bold text-slate-900 text-sm">
-                                {msg.proposal.title}
-                              </p>
-                            </div>
-                            <div>
-                              <span className="text-[10px] font-bold text-slate-400 uppercase">
-                                要約内容
-                              </span>
-                              <p className="text-xs text-slate-600 leading-relaxed">
-                                {msg.proposal.detail}
-                              </p>
-                            </div>
-
-                            {/* 優先度選択（通常 / 急ぎ） */}
-                            <div className="flex items-center justify-between bg-slate-50 px-3 py-2 rounded-xl border border-slate-200/80">
-                              <span className="text-[11px] font-bold text-slate-600">優先度：</span>
-                              <div className="flex gap-1.5">
-                                {(['通常', '急ぎ'] as const).map((p) => {
-                                  const currentP: TaskPriority =
-                                    msg.proposal?.priority === '急ぎ' ? '急ぎ' : '通常';
-                                  const active = currentP === p;
-                                  return (
-                                    <button
-                                      key={p}
-                                      type="button"
-                                      disabled={msg.isSubmitted}
-                                      onClick={() => handleUpdateProposalPriority(index, p)}
-                                      className={`text-xs font-bold px-3 py-1 rounded-lg transition-all ${
-                                        active
-                                          ? p === '急ぎ'
-                                            ? 'bg-rose-600 text-white shadow-xs'
-                                            : 'bg-slate-800 text-white shadow-xs'
-                                          : 'bg-white text-slate-500 border border-slate-200 hover:bg-slate-100'
-                                      }`}
-                                    >
-                                      {p === '急ぎ' ? '🔥 急ぎ' : '通常'}
-                                    </button>
-                                  );
-                                })}
-                              </div>
-                            </div>
-
-                            {msg.proposal.tags && msg.proposal.tags.length > 0 && (
-                              <div className="flex flex-wrap gap-1.5">
-                                {msg.proposal.tags.map((tag, i) => (
-                                  <span
-                                    key={i}
-                                    className="text-[11px] bg-slate-100 text-slate-600 px-2 py-0.5 rounded-full font-medium"
-                                  >
-                                    #{tag}
-                                  </span>
-                                ))}
-                              </div>
-                            )}
-                            <button
-                              onClick={() => handleCreateTaskFromProposal(msg.proposal!, index)}
-                              disabled={isSendingBoard || msg.isSubmitted}
-                              className={`w-full font-bold py-3 px-4 rounded-xl text-sm transition-all ${
-                                msg.isSubmitted
-                                  ? 'bg-emerald-50 text-emerald-700 border border-emerald-200 cursor-default'
-                                  : 'bg-blue-600 hover:bg-blue-700 text-white shadow-sm active:scale-95'
-                              }`}
-                            >
-                              {msg.isSubmitted
-                                ? '✓ ボードへ送信済み'
-                                : isSendingBoard
-                                ? '送信中...'
-                                : `✨ 選択した${proposalDepts.length}部署へ依頼を送る`}
-                            </button>
-                          </div>
-                        </div>
-                      );
-                    })()}
-                  </div>
-                </div>
-              ))}
-
-              {isThinking && (
-                <div className="flex items-center gap-3">
-                  <div className="w-9 h-9 rounded-2xl bg-gradient-to-tr from-blue-600 to-indigo-500 text-white flex items-center justify-center text-base">
-                    🤖
-                  </div>
-                  <div className="bg-white border border-slate-200 px-4 py-3 rounded-2xl rounded-tl-sm flex items-center gap-2.5 shadow-sm">
-                    <div className="flex items-center gap-1">
-                      <span className="w-2 h-2 bg-blue-400 rounded-full animate-bounce"></span>
-                      <span className="w-2 h-2 bg-blue-400 rounded-full animate-bounce [animation-delay:0.15s]"></span>
-                      <span className="w-2 h-2 bg-blue-400 rounded-full animate-bounce [animation-delay:0.3s]"></span>
-                    </div>
-                    <span className="text-xs text-slate-500">{thinkingText}</span>
-                  </div>
-                </div>
-              )}
-              <div ref={chatEndRef} />
+                  🔥 急ぎのみ
+                </button>
+              </div>
             </div>
 
-            {messages.length === 1 && departments.length > 0 && (
-              <div className="px-5 py-2.5 bg-white border-t border-slate-100 flex flex-wrap gap-2">
-                {QUICK_PROMPTS.map((q, idx) => (
+            {allDepartments.length > 0 && (
+              <div className="flex flex-wrap items-center gap-1.5">
+                <button
+                  onClick={() => setBoardDeptFilter('すべて')}
+                  className={`text-xs font-bold px-3 py-1.5 rounded-full ${
+                    boardDeptFilter === 'すべて'
+                      ? 'bg-emerald-600 text-white'
+                      : 'bg-white text-slate-600 border border-slate-200'
+                  }`}
+                >
+                  すべて
+                </button>
+                {allDepartments.map((d) => (
                   <button
-                    key={idx}
-                    onClick={() => handleSendMessage(q)}
-                    className="text-xs bg-slate-50 hover:bg-blue-50 hover:text-blue-700 hover:border-blue-200 text-slate-600 border border-slate-200 px-3 py-1.5 rounded-full transition-colors"
+                    key={d}
+                    onClick={() => setBoardDeptFilter(d)}
+                    className={`text-xs font-bold px-3 py-1.5 rounded-full ${
+                      boardDeptFilter === d
+                        ? 'bg-emerald-600 text-white'
+                        : 'bg-white text-slate-600 border border-slate-200'
+                    }`}
                   >
-                    {q}
+                    {d}
                   </button>
                 ))}
               </div>
             )}
 
-            <div className="p-4 bg-white border-t border-slate-200/80 flex gap-2.5">
-              <input
-                type="text"
-                value={inputText}
-                onChange={(e) => setInputText(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && !e.nativeEvent.isComposing) handleSendMessage();
-                }}
-                placeholder="お困りごとを気軽に入力してください..."
-                className="flex-1 px-4 py-3 rounded-xl bg-slate-50 border border-slate-200 focus:bg-white focus:ring-2 focus:ring-blue-500 outline-none text-sm transition-all"
-              />
-              <button
-                onClick={() => handleSendMessage()}
-                disabled={isThinking || !inputText.trim() || departments.length === 0}
-                className="bg-blue-600 hover:bg-blue-700 disabled:bg-slate-300 text-white font-bold px-6 py-3 rounded-xl text-sm shadow-sm transition-all active:scale-95"
-              >
-                送信
-              </button>
-            </div>
-          </div>
-        )}
-
-        {/* =========================================
-            【2】マイページ
-        ========================================= */}
-        {activeTab === 'mypage' && (
-          <div className="max-w-5xl mx-auto space-y-6">
-            <div className="flex flex-wrap items-center justify-between gap-4">
-              <div>
-                <h2 className="text-2xl font-black text-slate-900">マイページ</h2>
-                <p className="text-sm text-slate-500">
-                  カードをクリックすると優先度変更・複数部署の追加変更・コメント履歴が開きます
-                </p>
-              </div>
-              <button
-                onClick={() => setActiveTab('chat')}
-                className="bg-blue-600 hover:bg-blue-700 text-white text-xs md:text-sm font-bold px-4 py-2.5 rounded-xl shadow-sm transition-all"
-              >
-                ＋ 新しく相談する
-              </button>
-            </div>
-
-            <div className="bg-white p-4 rounded-2xl border border-slate-200/80 shadow-sm flex flex-wrap items-center justify-between gap-3">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="text-xs font-bold text-slate-500">
-                  📧 あなたの担当部署（{user.email}）：
-                </span>
-                {myAssignedDepts.length === 0 ? (
-                  <span className="text-xs text-slate-400">未設定</span>
-                ) : (
-                  myAssignedDepts.map((d) => (
-                    <span
-                      key={d.id}
-                      className="text-xs font-bold bg-indigo-50 text-indigo-700 border border-indigo-200 px-3 py-1 rounded-full"
-                    >
-                      🏢 {d.name}
-                    </span>
-                  ))
-                )}
-              </div>
-              <button
-                onClick={() => {
-                  setActiveTab('admin');
-                  setAdminView('departments');
-                  if (user.email) syncBulkSelectionForEmail(user.email);
-                }}
-                className="text-xs font-bold text-blue-600 hover:underline"
-              >
-                ⚙️ 担当・兼任部署を設定する →
-              </button>
-            </div>
-
-            {/* タブ切り替え ＆ マイページ内キーワード検索 */}
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div className="flex gap-2 bg-white p-1.5 rounded-2xl border border-slate-200 w-fit">
-                <button
-                  onClick={() => setMypageView('requested')}
-                  className={`px-4 py-2 rounded-xl text-xs md:text-sm font-bold transition-all ${
-                    mypageView === 'requested'
-                      ? 'bg-blue-600 text-white shadow-sm'
-                      : 'text-slate-500 hover:text-slate-800'
-                  }`}
-                >
-                  📤 自分がお願いした依頼（{myTasks.length}）
-                </button>
-                <button
-                  onClick={() => setMypageView('assigned')}
-                  className={`px-4 py-2 rounded-xl text-xs md:text-sm font-bold transition-all flex items-center gap-1.5 ${
-                    mypageView === 'assigned'
-                      ? 'bg-blue-600 text-white shadow-sm'
-                      : 'text-slate-500 hover:text-slate-800'
-                  }`}
-                >
-                  📥 担当部署に届いた依頼
-                  {myAssignedDepts.length > 0 && (
-                    <span
-                      className={`text-[10px] px-1.5 py-0.5 rounded-full ${
-                        mypageView === 'assigned'
-                          ? 'bg-white/20 text-white'
-                          : 'bg-amber-100 text-amber-700'
-                      }`}
-                    >
-                      {myDeptActiveCount}件未完了
-                    </span>
-                  )}
-                </button>
-              </div>
-
-              <div className="relative flex-1 min-w-[220px] max-w-sm">
-                <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400 text-xs">
-                  🔍
-                </span>
-                <input
-                  type="text"
-                  value={mypageSearchQuery}
-                  onChange={(e) => setMypageSearchQuery(e.target.value)}
-                  placeholder="キーワード検索（タイトル・内容・履歴）..."
-                  className="w-full bg-white border border-slate-200 rounded-xl pl-9 pr-8 py-2 text-xs outline-none focus:ring-2 focus:ring-blue-500"
-                />
-                {mypageSearchQuery && (
-                  <button
-                    onClick={() => setMypageSearchQuery('')}
-                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700 text-xs font-bold"
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+              {boardColumns.map((col) => {
+                const colItems = filteredBoardActions
+                  .filter((a) => a.status === col.key)
+                  .sort((a, b) => Number(b.priority === '急ぎ') - Number(a.priority === '急ぎ'));
+                return (
+                  <div
+                    key={col.key}
+                    className={`${col.bg} rounded-3xl p-4 border border-slate-200/80 min-h-[540px]`}
                   >
-                    ✕
-                  </button>
-                )}
-              </div>
-            </div>
-
-            {mypageView === 'requested' && (
-              <>
-                <div className="grid grid-cols-3 gap-4">
-                  <div className="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-sm">
-                    <span className="text-xs font-bold text-slate-400">未処理</span>
-                    <p className="text-3xl font-black text-blue-600 mt-1">
-                      {myPending}
-                      <span className="text-xs font-normal text-slate-400 ml-1">件</span>
-                    </p>
-                  </div>
-                  <div className="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-sm">
-                    <span className="text-xs font-bold text-slate-400">対応中</span>
-                    <p className="text-3xl font-black text-amber-500 mt-1">
-                      {myInProgress}
-                      <span className="text-xs font-normal text-slate-400 ml-1">件</span>
-                    </p>
-                  </div>
-                  <div className="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-sm">
-                    <span className="text-xs font-bold text-slate-400">完了</span>
-                    <p className="text-3xl font-black text-emerald-600 mt-1">
-                      {myCompleted}
-                      <span className="text-xs font-normal text-slate-400 ml-1">件</span>
-                    </p>
-                  </div>
-                </div>
-
-                <div className="bg-white rounded-3xl shadow-sm border border-slate-200/80 p-6">
-                  <div className="flex items-center justify-between mb-4">
-                    <h3 className="font-bold text-slate-800">お願いした依頼の進捗</h3>
-                    {mypageSearchQuery && (
-                      <span className="text-xs text-slate-500">
-                        検索結果：{filteredMyTasks.length}件
+                    <div className="flex items-center justify-between mb-4 px-1">
+                      <h3 className="font-bold text-slate-800 flex items-center gap-2">
+                        <span className={`w-2.5 h-2.5 rounded-full ${col.dot}`} />
+                        {col.label}
+                      </h3>
+                      <span className={`${col.badge} text-xs font-bold px-2.5 py-0.5 rounded-full`}>
+                        {colItems.length}件
                       </span>
-                    )}
-                  </div>
-                  {filteredMyTasks.length === 0 ? (
-                    <div className="text-center py-14 border-2 border-dashed border-slate-100 rounded-2xl">
-                      <p className="text-3xl mb-2">{mypageSearchQuery ? '🔎' : '📭'}</p>
-                      <p className="text-slate-500 text-sm font-medium">
-                        {mypageSearchQuery
-                          ? `「${mypageSearchQuery}」に一致する依頼が見つかりませんでした`
-                          : 'まだ依頼したタスクはありません'}
-                      </p>
-                      {!mypageSearchQuery && (
-                        <button
-                          onClick={() => setActiveTab('chat')}
-                          className="mt-4 text-blue-600 text-sm font-bold hover:underline"
-                        >
-                          AIチャットで相談してみる →
-                        </button>
-                      )}
                     </div>
-                  ) : (
-                    <div className="space-y-4">
-                      {filteredMyTasks.map((task) => {
-                        const step =
-                          task.status === '完了' ? 3 : task.status === '対応中' ? 2 : 1;
-                        const logCount = task.history?.length || 0;
-                        const isUrgent = task.priority === '急ぎ';
-                        const taskDepts = getTaskDepts(task);
-                        return (
+
+                    <div className="space-y-3">
+                      {colItems.length === 0 ? (
+                        <div className="h-24 border-2 border-dashed border-slate-200 rounded-2xl flex items-center justify-center text-xs text-slate-400">
+                          課題はありません
+                        </div>
+                      ) : (
+                        colItems.map((item) => (
                           <div
-                            key={task.id}
-                            onClick={() => openTaskModal(task)}
-                            className={`cursor-pointer p-5 border rounded-2xl hover:border-blue-300 hover:bg-blue-50/20 transition-all ${
-                              isUrgent && task.status !== '完了'
-                                ? 'border-rose-300 bg-rose-50/20'
-                                : 'border-slate-200/80'
-                            }`}
-                          >
-                            <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
-                              <div className="flex flex-wrap items-center gap-1.5">
-                                {isUrgent && (
-                                  <span className="text-[11px] font-extrabold bg-rose-100 text-rose-700 border border-rose-200 px-2.5 py-0.5 rounded-full">
-                                    🔥 急ぎ
-                                  </span>
-                                )}
-                                {taskDepts.map((dName) => (
-                                  <span
-                                    key={dName}
-                                    className="text-xs font-bold bg-blue-50 text-blue-700 px-2.5 py-0.5 rounded-full"
-                                  >
-                                    🏢 {dName}
-                                  </span>
-                                ))}
-                                {logCount > 0 && (
-                                  <span className="text-[11px] font-bold bg-slate-100 text-slate-600 px-2.5 py-0.5 rounded-full">
-                                    💬 履歴 {logCount}件
-                                  </span>
-                                )}
-                              </div>
-                              <div className="flex items-center gap-3">
-                                <span className="text-xs text-slate-400">
-                                  {formatTimestamp(task.createdAt)}
-                                </span>
-                                <button
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleDeleteTask(task);
-                                  }}
-                                  className="text-xs text-red-500 hover:bg-red-50 font-bold px-2.5 py-1 rounded-lg transition-colors"
-                                  title="この依頼を削除"
-                                >
-                                  削除
-                                </button>
-                              </div>
-                            </div>
-
-                            <h4 className="font-bold text-slate-900 mb-1.5">{task.title}</h4>
-                            <p className="text-sm text-slate-600 leading-relaxed mb-4">
-                              {task.detail}
-                            </p>
-
-                            <div className="bg-slate-50 p-3 rounded-xl mb-3">
-                              <div className="flex items-center justify-between text-[11px] font-bold mb-1.5">
-                                <span className={step >= 1 ? 'text-blue-600' : 'text-slate-400'}>
-                                  ① 受付・未処理
-                                </span>
-                                <span className={step >= 2 ? 'text-amber-600' : 'text-slate-400'}>
-                                  ② 担当者が対応中
-                                </span>
-                                <span className={step >= 3 ? 'text-emerald-600' : 'text-slate-400'}>
-                                  ③ 対応完了
-                                </span>
-                              </div>
-                              <div className="w-full h-2 bg-slate-200 rounded-full overflow-hidden">
-                                <div
-                                  className={`h-full transition-all duration-500 ${
-                                    step === 3
-                                      ? 'w-full bg-emerald-500'
-                                      : step === 2
-                                      ? 'w-2/3 bg-amber-400'
-                                      : 'w-1/3 bg-blue-500'
-                                  }`}
-                                />
-                              </div>
-                            </div>
-
-                            {task.adminComment && (
-                              <div className="bg-emerald-50/70 border border-emerald-200 text-emerald-900 text-xs p-3 rounded-xl">
-                                <span className="font-bold block mb-0.5">
-                                  💬 最新の返信メモ：
-                                </span>
-                                {task.adminComment}
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-              </>
-            )}
-
-            {mypageView === 'assigned' && (
-              <div className="bg-white rounded-3xl shadow-sm border border-slate-200/80 p-6">
-                {myAssignedDepts.length === 0 ? (
-                  <div className="text-center py-12 space-y-3">
-                    <p className="text-3xl">🏢</p>
-                    <p className="font-bold text-slate-800">
-                      あなたのメールアドレス（{user.email}）に紐づく部署がまだありません
-                    </p>
-                    <p className="text-xs text-slate-500">
-                      「部署・メール管理」から自分のアドレスを担当部署（複数兼任OK）に登録すると、ここに自動で一覧表示されます。
-                    </p>
-                    <button
-                      onClick={() => {
-                        setActiveTab('admin');
-                        setAdminView('departments');
-                        if (user.email) syncBulkSelectionForEmail(user.email);
-                      }}
-                      className="bg-blue-600 text-white text-xs font-bold px-5 py-2.5 rounded-xl shadow-sm"
-                    >
-                      担当部署を登録しに行く →
-                    </button>
-                  </div>
-                ) : (
-                  <div className="space-y-4">
-                    {myAssignedDepts.length > 1 && (
-                      <div className="flex flex-wrap items-center gap-2 pb-2 border-b border-slate-100">
-                        <span className="text-xs font-bold text-slate-400">兼任部署の絞り込み：</span>
-                        <button
-                          onClick={() => setMyDeptFilter('すべて')}
-                          className={`text-xs font-bold px-3 py-1.5 rounded-full ${
-                            myDeptFilter === 'すべて'
-                              ? 'bg-blue-600 text-white'
-                              : 'bg-slate-100 text-slate-600'
-                          }`}
-                        >
-                          担当すべて（{allAssignedTasks.length}）
-                        </button>
-                        {myAssignedDepts.map((d) => {
-                          const cnt = allAssignedTasks.filter((t) =>
-                            getTaskDepts(t).includes(d.name)
-                          ).length;
-                          return (
-                            <button
-                              key={d.id}
-                              onClick={() => setMyDeptFilter(d.name)}
-                              className={`text-xs font-bold px-3 py-1.5 rounded-full ${
-                                myDeptFilter === d.name
-                                  ? 'bg-blue-600 text-white'
-                                  : 'bg-slate-100 text-slate-600'
-                              }`}
-                            >
-                              {d.name}（{cnt}）
-                            </button>
-                          );
-                        })}
-                      </div>
-                    )}
-
-                    {displayedAssignedTasks.length === 0 ? (
-                      <p className="text-center text-sm text-slate-400 py-10">
-                        {mypageSearchQuery
-                          ? `「${mypageSearchQuery}」に一致する依頼はありません`
-                          : '現在届いている依頼はありません'}
-                      </p>
-                    ) : (
-                      displayedAssignedTasks.map((task) => {
-                        const isUrgent = task.priority === '急ぎ';
-                        const taskDepts = getTaskDepts(task);
-                        return (
-                          <div
-                            key={task.id}
-                            onClick={() => openTaskModal(task)}
-                            className={`cursor-pointer p-5 border rounded-2xl hover:border-blue-300 hover:bg-blue-50/20 flex flex-col gap-3 transition-all ${
-                              isUrgent && task.status !== '完了'
-                                ? 'border-rose-300 bg-rose-50/20'
+                            key={item.id}
+                            onClick={() => {
+                              setSelectedActionId(item.id);
+                              setModalCommentText('');
+                            }}
+                            className={`cursor-pointer bg-white p-4 rounded-2xl shadow-sm border transition-all hover:shadow-md hover:border-emerald-300 ${
+                              col.key === '完了'
+                                ? 'opacity-75 border-slate-200'
+                                : item.priority === '急ぎ'
+                                ? 'border-rose-300 ring-1 ring-rose-100'
                                 : 'border-slate-200'
                             }`}
                           >
-                            <div className="flex flex-wrap items-center justify-between gap-2">
-                              <div className="flex flex-wrap items-center gap-1.5">
-                                {isUrgent && (
-                                  <span className="text-[11px] font-extrabold bg-rose-100 text-rose-700 border border-rose-200 px-2.5 py-0.5 rounded-full">
+                            <div className="flex items-start justify-between gap-2 mb-2">
+                              <div className="flex flex-wrap gap-1.5">
+                                {item.priority === '急ぎ' && (
+                                  <span className="bg-rose-100 text-rose-700 text-[10px] font-extrabold px-2 py-0.5 rounded-full">
                                     🔥 急ぎ
                                   </span>
                                 )}
-                                <span
-                                  className={`text-xs font-bold px-2.5 py-1 rounded-full ${
-                                    task.status === '完了'
-                                      ? 'bg-emerald-100 text-emerald-700'
-                                      : task.status === '対応中'
-                                      ? 'bg-amber-100 text-amber-700'
-                                      : 'bg-blue-100 text-blue-700'
-                                  }`}
-                                >
-                                  {task.status}
+                                <span className="bg-emerald-50 text-emerald-700 text-[11px] font-bold px-2 py-0.5 rounded-full">
+                                  👤 {item.memberName}
                                 </span>
-                                {taskDepts.map((dName) => (
-                                  <span
-                                    key={dName}
-                                    className="text-xs font-bold bg-indigo-50 text-indigo-700 px-2.5 py-1 rounded-full"
-                                  >
-                                    {dName}
-                                  </span>
-                                ))}
-                                <span className="text-xs text-slate-500">
-                                  依頼者：{task.creatorName || '社員'}
-                                  {task.creatorEmail ? ` (${task.creatorEmail})` : ''}
+                                <span className="bg-slate-100 text-slate-600 text-[10px] font-bold px-2 py-0.5 rounded-full">
+                                  {item.department}
                                 </span>
                               </div>
-                              <div className="flex items-center gap-3">
-                                <span className="text-xs text-slate-400">
-                                  {formatTimestamp(task.createdAt)}
-                                </span>
-                                <button
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    handleDeleteTask(task);
-                                  }}
-                                  className="text-xs text-red-500 hover:bg-red-50 font-bold px-2.5 py-1 rounded-lg transition-colors"
-                                  title="このタスクを削除"
-                                >
-                                  削除
-                                </button>
-                              </div>
-                            </div>
-
-                            <div>
-                              <h4 className="font-bold text-slate-900">{task.title}</h4>
-                              <p className="text-xs text-slate-600 mt-1">{task.detail}</p>
-                            </div>
-
-                            {task.status !== '完了' && (
-                              <div
-                                onClick={(e) => e.stopPropagation()}
-                                className="flex flex-col sm:flex-row gap-2 pt-2 border-t border-slate-100"
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleDeleteAction(item);
+                                }}
+                                className="text-[11px] text-red-400 hover:text-red-600 px-1"
                               >
-                                <input
-                                  type="text"
-                                  placeholder="返信メモ（依頼者・担当部長へメール通知されます）"
-                                  value={commentDrafts[task.id] || ''}
-                                  onChange={(e) =>
-                                    setCommentDrafts((prev) => ({
-                                      ...prev,
-                                      [task.id]: e.target.value,
-                                    }))
-                                  }
-                                  className="flex-1 text-xs border border-slate-200 rounded-xl px-3 py-2 outline-none focus:border-blue-500 bg-white"
-                                />
-                                <button
-                                  onClick={() =>
-                                    handleStatusChange(
-                                      task,
-                                      task.status === '未処理' ? '対応中' : '完了'
-                                    )
-                                  }
-                                  className={`text-xs font-bold text-white px-4 py-2 rounded-xl shrink-0 ${
-                                    task.status === '未処理'
-                                      ? 'bg-blue-600 hover:bg-blue-700'
-                                      : 'bg-emerald-600 hover:bg-emerald-700'
-                                  }`}
-                                >
-                                  {task.status === '未処理' ? '対応中にする →' : '完了にする ✓'}
-                                </button>
+                                ✕
+                              </button>
+                            </div>
+
+                            <h4
+                              className={`font-bold text-sm text-slate-900 mb-1.5 ${
+                                col.key === '完了' ? 'line-through text-slate-500' : ''
+                              }`}
+                            >
+                              {item.title}
+                            </h4>
+                            <p className="text-xs text-slate-500 leading-relaxed mb-3">
+                              {item.detail}
+                            </p>
+
+                            <div
+                              onClick={(e) => e.stopPropagation()}
+                              className="flex items-center justify-between pt-2.5 border-t border-slate-100"
+                            >
+                              <span className="text-[11px] text-slate-400">
+                                💬 {item.history?.length || 0}件
+                              </span>
+                              <div className="flex gap-1.5">
+                                {col.key !== '未着手' && (
+                                  <button
+                                    onClick={() =>
+                                      handleChangeActionStatus(
+                                        item,
+                                        col.key === '完了' ? '対応中' : '未着手'
+                                      )
+                                    }
+                                    className="text-xs text-slate-400 hover:text-slate-700 px-2 py-1"
+                                  >
+                                    ← 戻す
+                                  </button>
+                                )}
+                                {col.key !== '完了' && (
+                                  <button
+                                    onClick={() =>
+                                      handleChangeActionStatus(
+                                        item,
+                                        col.key === '未着手' ? '対応中' : '完了'
+                                      )
+                                    }
+                                    className={`text-xs font-bold text-white px-3 py-1 rounded-lg ${
+                                      col.key === '未着手'
+                                        ? 'bg-emerald-600 hover:bg-emerald-700'
+                                        : 'bg-slate-900 hover:bg-slate-800'
+                                    }`}
+                                  >
+                                    {col.key === '未着手' ? '対応中へ →' : '完了 ✓'}
+                                  </button>
+                                )}
                               </div>
-                            )}
+                            </div>
                           </div>
-                        );
-                      })
-                    )}
+                        ))
+                      )}
+                    </div>
                   </div>
-                )}
-              </div>
-            )}
+                );
+              })}
+            </div>
           </div>
         )}
 
         {/* =========================================
-            【3】全体管理
+            【4】部員マスタ管理（スプレッドシート一括取り込み）
         ========================================= */}
-        {activeTab === 'admin' && (
-          <div className="max-w-7xl mx-auto">
-            <div className="flex flex-wrap items-center justify-between gap-4 mb-4">
-              <div className="flex flex-wrap gap-1.5 bg-white p-1.5 rounded-2xl border border-slate-200">
-                <button
-                  onClick={() => setAdminView('board')}
-                  className={`px-4 py-2 rounded-xl text-xs md:text-sm font-bold transition-all ${
-                    adminView === 'board'
-                      ? 'bg-slate-900 text-white'
-                      : 'text-slate-500 hover:text-slate-800'
-                  }`}
-                >
-                  📋 手伝えるかもボード
-                </button>
-                <button
-                  onClick={() => setAdminView('analytics')}
-                  className={`px-4 py-2 rounded-xl text-xs md:text-sm font-bold transition-all ${
-                    adminView === 'analytics'
-                      ? 'bg-slate-900 text-white'
-                      : 'text-slate-500 hover:text-slate-800'
-                  }`}
-                >
-                  📊 分析ダッシュボード
-                </button>
-                <button
-                  onClick={() => setAdminView('departments')}
-                  className={`px-4 py-2 rounded-xl text-xs md:text-sm font-bold transition-all ${
-                    adminView === 'departments'
-                      ? 'bg-slate-900 text-white'
-                      : 'text-slate-500 hover:text-slate-800'
-                  }`}
-                >
-                  🏢 部署・メール管理
-                </button>
-              </div>
-
-              {adminView === 'board' && (
-                <div className="flex flex-wrap items-center gap-2">
-                  {/* キーワード検索窓 */}
-                  <div className="relative w-64 sm:w-72">
-                    <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400 text-xs">
-                      🔍
-                    </span>
-                    <input
-                      type="text"
-                      value={boardSearchQuery}
-                      onChange={(e) => setBoardSearchQuery(e.target.value)}
-                      placeholder="過去の相談を検索（例：VPN 契約書）"
-                      className="w-full bg-white border border-slate-200 rounded-xl pl-9 pr-8 py-2 text-xs outline-none focus:ring-2 focus:ring-blue-500"
-                    />
-                    {boardSearchQuery && (
-                      <button
-                        onClick={() => setBoardSearchQuery('')}
-                        className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700 text-xs font-bold"
-                      >
-                        ✕
-                      </button>
-                    )}
-                  </div>
-
-                  {/* 急ぎのみ絞り込みボタン */}
-                  <button
-                    onClick={() => setBoardUrgentOnly((prev) => !prev)}
-                    className={`text-xs font-bold px-3.5 py-2 rounded-xl border transition-all ${
-                      boardUrgentOnly
-                        ? 'bg-rose-600 text-white border-rose-600 shadow-xs'
-                        : 'bg-white text-rose-600 border-rose-200 hover:bg-rose-50'
-                    }`}
-                  >
-                    🔥 急ぎのみ {boardUrgentOnly ? 'ON' : ''}
-                  </button>
-                </div>
-              )}
+        {activeTab === 'members' && (
+          <div className="max-w-5xl space-y-6">
+            {/* スプレッドシートからのコピペ一括取り込み */}
+            <div className="bg-white p-6 rounded-3xl border border-emerald-200/80 shadow-sm space-y-3">
+              <h3 className="font-bold text-base text-slate-900">
+                📥 スプレッドシートから一括取り込み
+              </h3>
+              <p className="text-xs text-slate-500">
+                既存のスプレッドシートの「氏名・メールアドレス・部署・役職」の行をそのままコピーして貼り付けるだけで登録できます（カンマ区切り・タブ区切り両対応）。
+              </p>
+              <textarea
+                rows={4}
+                placeholder={`例（スプレッドシートからそのままコピペOK）：\n井上陽斗\tinoue@company.co.jp\t営業部\t部員\n武田太郎\ttakeda@company.co.jp\t開発部\t部員`}
+                value={bulkPasteText}
+                onChange={(e) => setBulkPasteText(e.target.value)}
+                className="w-full border border-slate-200 rounded-2xl px-4 py-3 text-xs font-mono outline-none focus:ring-2 focus:ring-emerald-500"
+              />
+              <button
+                onClick={handleBulkImportMembers}
+                disabled={isBulkImporting || !bulkPasteText.trim()}
+                className="bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-300 text-white font-bold px-5 py-2.5 rounded-xl text-xs shadow-sm"
+              >
+                {isBulkImporting ? '取り込み中...' : '✓ 貼り付けた部員を一括登録する'}
+              </button>
             </div>
 
-            {/* 部署絞り込みバー */}
-            {adminView === 'board' && (
-              <div className="flex flex-wrap items-center justify-between gap-2 mb-6">
-                <div className="flex items-center gap-2 overflow-x-auto pb-1">
-                  <span className="text-xs font-bold text-slate-400 shrink-0">部署絞り込み：</span>
-                  <button
-                    onClick={() => setDeptFilter('すべて')}
-                    className={`text-xs font-bold px-3 py-1.5 rounded-full transition-colors shrink-0 ${
-                      deptFilter === 'すべて'
-                        ? 'bg-blue-600 text-white'
-                        : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'
-                    }`}
-                  >
-                    すべて
-                  </button>
-                  {departments.map((d) => (
-                    <button
-                      key={d.id}
-                      onClick={() => setDeptFilter(d.name)}
-                      className={`text-xs font-bold px-3 py-1.5 rounded-full transition-colors shrink-0 ${
-                        deptFilter === d.name
-                          ? 'bg-blue-600 text-white'
-                          : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'
-                      }`}
-                    >
-                      {d.name}
-                    </button>
-                  ))}
-                </div>
-
-                {(boardSearchQuery || boardUrgentOnly || deptFilter !== 'すべて') && (
-                  <div className="flex items-center gap-2 text-xs text-slate-500">
-                    <span>表示中：{filteredBoardTasks.length}件</span>
-                    <button
-                      onClick={() => {
-                        setBoardSearchQuery('');
-                        setBoardUrgentOnly(false);
-                        setDeptFilter('すべて');
-                      }}
-                      className="text-blue-600 font-bold hover:underline"
-                    >
-                      条件リセット
-                    </button>
-                  </div>
-                )}
+            {/* 個別追加 */}
+            <div className="bg-white p-6 rounded-3xl border border-slate-200/80 shadow-sm space-y-4">
+              <h3 className="font-bold text-base text-slate-900">👤 部員を1名追加</h3>
+              <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
+                <input
+                  type="text"
+                  placeholder="氏名（例：井上陽斗）"
+                  value={newMemberName}
+                  onChange={(e) => setNewMemberName(e.target.value)}
+                  className="border border-slate-200 rounded-xl px-3.5 py-2.5 text-sm outline-none focus:border-emerald-500"
+                />
+                <input
+                  type="email"
+                  placeholder="メールアドレス"
+                  value={newMemberEmail}
+                  onChange={(e) => setNewMemberEmail(e.target.value)}
+                  className="border border-slate-200 rounded-xl px-3.5 py-2.5 text-sm outline-none focus:border-emerald-500"
+                />
+                <input
+                  type="text"
+                  placeholder="部署名"
+                  value={newMemberDept}
+                  onChange={(e) => setNewMemberDept(e.target.value)}
+                  className="border border-slate-200 rounded-xl px-3.5 py-2.5 text-sm outline-none focus:border-emerald-500"
+                />
+                <select
+                  value={newMemberRole}
+                  onChange={(e) => setNewMemberRole(e.target.value as MemberRole)}
+                  className="border border-slate-200 rounded-xl px-3.5 py-2.5 text-sm bg-white outline-none focus:border-emerald-500"
+                >
+                  <option value="部員">部員</option>
+                  <option value="部長">部長</option>
+                </select>
               </div>
-            )}
+              <button
+                onClick={handleAddMember}
+                className="bg-slate-900 hover:bg-slate-800 text-white font-bold px-5 py-2.5 rounded-xl text-xs"
+              >
+                ＋ 部員を追加
+              </button>
 
-            {adminView === 'board' && (
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                {statusConfig.map((col) => {
-                  const colTasks = filteredBoardTasks
-                    .filter((t) => t.status === col.key)
-                    .sort((a, b) => Number(b.priority === '急ぎ') - Number(a.priority === '急ぎ'));
-                  return (
-                    <div
-                      key={col.key}
-                      className={`${col.columnBg} rounded-3xl p-4 border border-slate-200/80 min-h-[600px]`}
-                    >
-                      <div className="flex items-center justify-between mb-4 px-1">
-                        <h3 className="font-bold text-slate-800 flex items-center gap-2">
-                          <span className={`w-2.5 h-2.5 rounded-full ${col.dot}`}></span>
-                          {col.label}
-                        </h3>
-                        <span className={`${col.badge} text-xs font-bold px-2.5 py-0.5 rounded-full`}>
-                          {colTasks.length}件
-                        </span>
-                      </div>
-
-                      <div className="space-y-3">
-                        {colTasks.length === 0 ? (
-                          <div className="h-28 border-2 border-dashed border-slate-200/80 rounded-2xl flex items-center justify-center text-slate-400 text-xs">
-                            該当するタスクはありません
-                          </div>
-                        ) : (
-                          colTasks.map((task) => {
-                            const logCount = task.history?.length || 0;
-                            const isUrgent = task.priority === '急ぎ';
-                            const taskDepts = getTaskDepts(task);
-                            return (
-                              <div
-                                key={task.id}
-                                onClick={() => openTaskModal(task)}
-                                className={`cursor-pointer bg-white p-5 rounded-2xl shadow-sm border transition-all hover:shadow-md hover:border-blue-300 ${
-                                  col.key === '完了'
-                                    ? 'opacity-75 border-slate-200/80'
-                                    : isUrgent
-                                    ? 'border-rose-300 ring-1 ring-rose-100'
-                                    : 'border-slate-200/80'
-                                }`}
-                              >
-                                <div className="flex items-start justify-between gap-2 mb-2.5">
-                                  <div className="flex flex-wrap items-center gap-1.5">
-                                    {isUrgent && (
-                                      <span className="bg-rose-100 text-rose-700 border border-rose-200 text-[10px] font-extrabold px-2 py-0.5 rounded-full">
-                                        🔥 急ぎ
-                                      </span>
-                                    )}
-                                    {taskDepts.map((dName) => (
-                                      <span
-                                        key={dName}
-                                        className="bg-blue-50 text-blue-700 border border-blue-100 text-[11px] font-bold px-2.5 py-0.5 rounded-full"
-                                      >
-                                        🤖 {dName}
-                                      </span>
-                                    ))}
-                                  </div>
-                                  <div className="flex items-center gap-2 shrink-0">
-                                    <span className="text-[11px] text-slate-400">
-                                      {formatTimestamp(task.createdAt)}
-                                    </span>
-                                    <button
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        handleDeleteTask(task);
-                                      }}
-                                      className="text-[11px] text-red-400 hover:text-red-600 hover:bg-red-50 font-bold px-1.5 py-0.5 rounded transition-colors"
-                                      title="カードを削除"
-                                    >
-                                      ✕
-                                    </button>
-                                  </div>
-                                </div>
-
-                                <h4
-                                  className={`font-bold text-slate-900 mb-1.5 ${
-                                    col.key === '完了' ? 'line-through text-slate-500' : ''
-                                  }`}
-                                >
-                                  {task.title}
-                                </h4>
-                                <p className="text-xs text-slate-500 leading-relaxed mb-3">
-                                  {task.detail}
-                                </p>
-
-                                {task.adminComment && (
-                                  <p className="text-[11px] bg-emerald-50 text-emerald-800 p-2 rounded-lg mb-3">
-                                    💬 {task.adminComment}
-                                  </p>
-                                )}
-
-                                {col.key !== '完了' && (
-                                  <input
-                                    type="text"
-                                    placeholder="返信メモ（依頼者・担当部長へメール通知）"
-                                    value={commentDrafts[task.id] || ''}
-                                    onClick={(e) => e.stopPropagation()}
-                                    onChange={(e) =>
-                                      setCommentDrafts((prev) => ({
-                                        ...prev,
-                                        [task.id]: e.target.value,
-                                      }))
-                                    }
-                                    className="w-full text-xs bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5 mb-3 outline-none focus:bg-white focus:border-blue-400"
-                                  />
-                                )}
-
-                                <div className="flex items-center justify-between pt-3 border-t border-slate-100">
-                                  <div className="flex items-center gap-2">
-                                    {task.creatorPhoto ? (
-                                      <img
-                                        src={task.creatorPhoto}
-                                        alt=""
-                                        className="w-5 h-5 rounded-full"
-                                      />
-                                    ) : (
-                                      <div className="w-5 h-5 rounded-full bg-slate-200 text-[10px] flex items-center justify-center font-bold text-slate-600">
-                                        {(task.creatorName || '社')[0]}
-                                      </div>
-                                    )}
-                                    <span className="text-[11px] text-slate-500 font-medium">
-                                      {task.creatorName || '社員'}
-                                    </span>
-                                    {logCount > 0 && (
-                                      <span className="text-[10px] font-bold text-blue-600 bg-blue-50 px-1.5 py-0.5 rounded">
-                                        💬 {logCount}
-                                      </span>
-                                    )}
-                                  </div>
-
-                                  <div
-                                    onClick={(e) => e.stopPropagation()}
-                                    className="flex items-center gap-1.5"
-                                  >
-                                    {col.key !== '未処理' && (
-                                      <button
-                                        onClick={() =>
-                                          handleStatusChange(
-                                            task,
-                                            col.key === '完了' ? '対応中' : '未処理'
-                                          )
-                                        }
-                                        className="text-xs text-slate-400 hover:text-slate-700 px-2 py-1"
-                                      >
-                                        ← 戻す
-                                      </button>
-                                    )}
-                                    {col.key !== '完了' && (
-                                      <button
-                                        onClick={() =>
-                                          handleStatusChange(
-                                            task,
-                                            col.key === '未処理' ? '対応中' : '完了'
-                                          )
-                                        }
-                                        className={`text-xs font-bold text-white px-3 py-1.5 rounded-lg transition-colors ${
-                                          col.key === '未処理'
-                                            ? 'bg-blue-600 hover:bg-blue-700'
-                                            : 'bg-emerald-600 hover:bg-emerald-700'
-                                        }`}
-                                      >
-                                        {col.key === '未処理' ? '対応する →' : '完了にする ✓'}
-                                      </button>
-                                    )}
-                                  </div>
-                                </div>
-                              </div>
-                            );
-                          })
-                        )}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-
-            {adminView === 'analytics' && (
-              <div className="space-y-6">
-                <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-                  <div className="bg-white p-6 rounded-3xl border border-slate-200/80 shadow-sm">
-                    <span className="text-xs font-bold text-slate-400">累計の相談件数</span>
-                    <p className="text-3xl font-black text-slate-900 mt-2">
-                      {totalCount}
-                      <span className="text-xs font-normal text-slate-400 ml-1">件</span>
-                    </p>
-                  </div>
-                  <div className="bg-white p-6 rounded-3xl border border-slate-200/80 shadow-sm">
-                    <span className="text-xs font-bold text-slate-400">タスク解決率</span>
-                    <p className="text-3xl font-black text-emerald-600 mt-2">
-                      {completionRate}
-                      <span className="text-sm font-bold ml-0.5">%</span>
-                    </p>
-                    <div className="w-full h-1.5 bg-slate-100 rounded-full mt-2 overflow-hidden">
-                      <div
-                        className="h-full bg-emerald-500"
-                        style={{ width: `${completionRate}%` }}
-                      />
-                    </div>
-                  </div>
-                  <div className="bg-white p-6 rounded-3xl border border-slate-200/80 shadow-sm">
-                    <span className="text-xs font-bold text-slate-400">現在アクティブ</span>
-                    <p className="text-3xl font-black text-amber-500 mt-2">
-                      {pendingCount + inProgressCount}
-                      <span className="text-xs font-normal text-slate-400 ml-1">
-                        件（急ぎ {urgentActiveCount}）
-                      </span>
-                    </p>
-                  </div>
-                  <div className="bg-white p-6 rounded-3xl border border-slate-200/80 shadow-sm">
-                    <span className="text-xs font-bold text-slate-400">最多相談の窓口</span>
-                    <p className="text-xl font-black text-blue-600 mt-3 truncate">{topDeptName}</p>
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                  <div className="bg-white p-6 rounded-3xl border border-slate-200/80 shadow-sm">
-                    <h3 className="font-bold text-slate-900 mb-1">📈 直近7日間の相談件数推移</h3>
-                    <p className="text-xs text-slate-400 mb-6">日ごとの新規ヘルプデスク相談数</p>
-                    <div className="h-48 flex items-end justify-between gap-3 pt-6 px-2 border-b border-slate-100">
-                      {dailyStats.map((d, i) => {
-                        const heightPct = Math.round((d.count / maxDailyCount) * 100);
-                        return (
-                          <div
-                            key={i}
-                            className="flex-1 flex flex-col items-center gap-2 h-full justify-end"
-                          >
-                            <span className="text-xs font-bold text-slate-600">{d.count}</span>
-                            <div
-                              className="w-full max-w-[36px] bg-gradient-to-t from-blue-600 to-indigo-400 rounded-t-xl transition-all duration-500"
-                              style={{ height: `${Math.max(heightPct, d.count > 0 ? 12 : 4)}%` }}
-                            />
-                          </div>
-                        );
-                      })}
-                    </div>
-                    <div className="flex justify-between gap-3 pt-2 px-2">
-                      {dailyStats.map((d, i) => (
-                        <span
-                          key={i}
-                          className="flex-1 text-center text-[11px] text-slate-400 font-medium"
-                        >
-                          {d.label}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-
-                  <div className="bg-white p-6 rounded-3xl border border-slate-200/80 shadow-sm">
-                    <h3 className="font-bold text-slate-900 mb-1">
-                      🏢 部署別の相談件数・ステータス内訳
-                    </h3>
-                    <p className="text-xs text-slate-400 mb-5">
-                      青＝未処理 / 黄＝対応中 / 緑＝完了（複数部署連携タスクは各部署に計上）
-                    </p>
-                    {deptStats.length === 0 ? (
-                      <p className="text-sm text-slate-400 py-10 text-center">データがありません</p>
-                    ) : (
-                      <div className="space-y-4">
-                        {deptStats.map((d) => {
-                          const widthPct = Math.round((d.total / maxDeptCount) * 100);
-                          return (
-                            <div key={d.name}>
-                              <div className="flex justify-between text-xs mb-1">
-                                <span className="font-bold text-slate-700">{d.name}</span>
-                                <span className="text-slate-500 font-medium">
-                                  計 {d.total}件（完了 {d.completed}）
-                                </span>
-                              </div>
-                              <div className="w-full h-3 bg-slate-100 rounded-full overflow-hidden">
-                                {d.total > 0 && (
-                                  <div
-                                    className="h-full flex rounded-full overflow-hidden"
-                                    style={{ width: `${Math.max(widthPct, 8)}%` }}
-                                  >
-                                    <div
-                                      style={{ width: `${(d.pending / d.total) * 100}%` }}
-                                      className="bg-blue-500"
-                                    />
-                                    <div
-                                      style={{ width: `${(d.inProgress / d.total) * 100}%` }}
-                                      className="bg-amber-400"
-                                    />
-                                    <div
-                                      style={{ width: `${(d.completed / d.total) * 100}%` }}
-                                      className="bg-emerald-500"
-                                    />
-                                  </div>
-                                )}
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </div>
-                </div>
-
-                <div className="bg-white p-6 rounded-3xl border border-slate-200/80 shadow-sm">
-                  <h3 className="font-bold text-slate-900 mb-3">🏷️ よく相談されているキーワード</h3>
-                  {topTags.length === 0 ? (
-                    <p className="text-xs text-slate-400">
-                      相談データが貯まると自動でキーワード集計が表示されます。
+              <div className="pt-4 border-t border-slate-100">
+                <h4 className="font-bold text-sm text-slate-800 mb-3">
+                  登録済み部員マスタ（{members.length}名）
+                </h4>
+                <div className="divide-y divide-slate-100 border border-slate-200/80 rounded-2xl overflow-hidden">
+                  {members.length === 0 ? (
+                    <p className="text-xs text-slate-400 text-center py-8">
+                      まだ登録されていません
                     </p>
                   ) : (
-                    <div className="flex flex-wrap gap-2">
-                      {topTags.map(([tag, count]) => (
-                        <span
-                          key={tag}
-                          className="bg-slate-100 text-slate-700 text-xs font-bold px-3 py-1.5 rounded-full flex items-center gap-1.5"
-                        >
-                          #{tag}
-                          <span className="bg-blue-600 text-white text-[10px] px-1.5 py-0.5 rounded-full">
-                            {count}
-                          </span>
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
-
-            {adminView === 'departments' && (
-              <div className="space-y-6 max-w-5xl">
-                <div className="bg-white p-6 md:p-7 rounded-3xl shadow-sm border border-indigo-200/80">
-                  <h3 className="font-bold text-base text-slate-900 mb-1">
-                    👤 兼任・担当部署のまとめ設定（1つのメールアドレスに複数部署を紐づけ）
-                  </h3>
-                  <p className="text-xs text-slate-500 mb-4">
-                    部長のメールアドレスを入力し、担当する部署すべてにチェックを入れて保存できます（何個でも兼任OK）。
-                  </p>
-
-                  <div className="flex flex-col sm:flex-row gap-2.5 mb-4">
-                    <input
-                      type="email"
-                      placeholder="部長のメールアドレス（例：bucho@company.co.jp）"
-                      value={bulkEmail}
-                      onChange={(e) => syncBulkSelectionForEmail(e.target.value)}
-                      className="flex-1 border border-slate-200 px-4 py-2.5 rounded-xl text-sm focus:ring-2 focus:ring-indigo-500 outline-none"
-                    />
-                    {user.email && (
-                      <button
-                        onClick={() => syncBulkSelectionForEmail(user.email || '')}
-                        className="bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-bold px-4 py-2.5 rounded-xl text-xs shrink-0"
+                    members.map((m) => (
+                      <div
+                        key={m.id}
+                        className="px-4 py-3 bg-white flex flex-wrap items-center justify-between gap-2 text-xs"
                       >
-                        自分のアドレス（{user.email}）を入れる
-                      </button>
-                    )}
-                  </div>
-
-                  {departments.length > 0 && (
-                    <div className="flex flex-wrap gap-2.5 mb-5">
-                      {departments.map((dept) => {
-                        const checked = bulkDeptIds.includes(dept.id);
-                        return (
-                          <label
-                            key={dept.id}
-                            onClick={() => toggleBulkDept(dept.id)}
-                            className={`cursor-pointer select-none px-4 py-2 rounded-xl border text-xs font-bold flex items-center gap-2 transition-all ${
-                              checked
-                                ? 'bg-indigo-600 text-white border-indigo-600 shadow-sm'
-                                : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'
-                            }`}
-                          >
-                            <span>{checked ? '☑' : '☐'}</span>
-                            {dept.name}
-                          </label>
-                        );
-                      })}
-                    </div>
-                  )}
-
-                  <button
-                    onClick={handleSaveBulkAssignment}
-                    className="bg-indigo-600 hover:bg-indigo-700 text-white font-bold px-6 py-2.5 rounded-xl text-xs shadow-sm"
-                  >
-                    ✓ チェックした部署にこのメールアドレスを紐づける
-                  </button>
-                </div>
-
-                <div className="bg-white p-6 md:p-7 rounded-3xl shadow-sm border border-slate-200/80">
-                  <h3 className="font-bold text-base text-slate-900 mb-1">新規部署の追加</h3>
-                  <p className="text-xs text-slate-500 mb-4">
-                    新しい部署を作る際も、そのまま担当部長のメールアドレスをセットできます。
-                  </p>
-                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-3">
-                    <input
-                      type="text"
-                      placeholder="部署名（例：情報システム部）"
-                      value={newDeptName}
-                      onChange={(e) => setNewDeptName(e.target.value)}
-                      className="border border-slate-200 px-4 py-2.5 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 outline-none"
-                    />
-                    <input
-                      type="email"
-                      placeholder="担当部長メール（任意・カンマ区切りで複数可）"
-                      value={newDeptEmail}
-                      onChange={(e) => setNewDeptEmail(e.target.value)}
-                      className="border border-slate-200 px-4 py-2.5 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 outline-none"
-                    />
-                    <input
-                      type="text"
-                      placeholder="得意分野（例：PC修理、Wi-Fi、アカウント）"
-                      value={newDeptExpertise}
-                      onChange={(e) => setNewDeptExpertise(e.target.value)}
-                      className="border border-slate-200 px-4 py-2.5 rounded-xl text-sm focus:ring-2 focus:ring-blue-500 outline-none"
-                    />
-                  </div>
-                  <button
-                    onClick={handleAddDepartment}
-                    className="bg-blue-600 hover:bg-blue-700 text-white font-bold px-6 py-2.5 rounded-xl text-xs mb-8"
-                  >
-                    ＋ 部署を追加
-                  </button>
-
-                  <h3 className="font-bold text-slate-800 mb-4">
-                    登録済みの部署・得意分野・担当部長メール一覧（{departments.length}件）
-                  </h3>
-                  <div className="space-y-4">
-                    {departments.map((dept) => {
-                      const expertiseVal = deptExpertiseDrafts[dept.id] ?? dept.expertise;
-                      const emailVal = deptEmailDrafts[dept.id] ?? dept.managerEmail ?? '';
-                      const isDirty =
-                        expertiseVal !== dept.expertise ||
-                        emailVal !== (dept.managerEmail ?? '');
-
-                      return (
-                        <div
-                          key={dept.id}
-                          className="p-4 md:p-5 border border-slate-200/80 bg-slate-50/70 rounded-2xl space-y-3"
-                        >
-                          <div className="flex items-center justify-between gap-4">
-                            <span className="font-bold text-blue-700 text-sm flex items-center gap-1.5">
-                              🏢 {dept.name}
-                            </span>
-                            <button
-                              onClick={async () => {
-                                if (confirm(`「${dept.name}」を削除しますか？`)) {
-                                  await deleteDoc(doc(db, 'departments', dept.id));
-                                }
-                              }}
-                              className="text-red-500 hover:bg-red-100 text-xs font-bold bg-red-50 px-3 py-1.5 rounded-lg shrink-0"
-                            >
-                              削除
-                            </button>
-                          </div>
-
-                          <div className="space-y-1">
-                            <label className="text-[11px] font-bold text-slate-500 block">
-                              💡 得意分野・キーワード（AI判定・バックアップ振り分けに使用）
-                            </label>
-                            <textarea
-                              rows={2}
-                              placeholder="例：PC修理、VPN、Wi-Fi、アカウント発行、パスワードリセット"
-                              value={expertiseVal}
-                              onChange={(e) =>
-                                setDeptExpertiseDrafts((prev) => ({
-                                  ...prev,
-                                  [dept.id]: e.target.value,
-                                }))
-                              }
-                              className="w-full bg-white border border-slate-200 px-3 py-2 rounded-xl text-xs leading-relaxed outline-none focus:border-blue-500 resize-y"
-                            />
-                          </div>
-
-                          <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 pt-1">
-                            <span className="text-xs font-bold text-slate-500 shrink-0">
-                              📧 担当部長メール：
-                            </span>
-                            <input
-                              type="text"
-                              placeholder="未設定（例: bucho@company.co.jp）"
-                              value={emailVal}
-                              onChange={(e) =>
-                                setDeptEmailDrafts((prev) => ({
-                                  ...prev,
-                                  [dept.id]: e.target.value,
-                                }))
-                              }
-                              className="flex-1 bg-white border border-slate-200 px-3 py-2 rounded-xl text-xs outline-none focus:border-blue-500"
-                            />
-                            <button
-                              onClick={() => handleSaveDeptDetails(dept)}
-                              className={`text-xs font-bold px-4 py-2 rounded-xl shrink-0 transition-colors ${
-                                isDirty
-                                  ? 'bg-blue-600 hover:bg-blue-700 text-white shadow-sm'
-                                  : 'bg-slate-800 hover:bg-slate-900 text-white'
-                              }`}
-                            >
-                              {isDirty ? '変更を保存' : '保存済み'}
-                            </button>
-                          </div>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="font-bold text-slate-900">{m.name}</span>
+                          <span className="bg-slate-100 text-slate-600 px-2 py-0.5 rounded-full font-bold">
+                            {m.department}
+                          </span>
+                          <span className="bg-emerald-50 text-emerald-700 px-2 py-0.5 rounded-full font-bold">
+                            {m.role}
+                          </span>
+                          <span className="text-slate-500">{m.email}</span>
                         </div>
-                      );
-                    })}
-                  </div>
+                        <button
+                          onClick={async () => {
+                            if (confirm(`${m.name}さんをマスタから削除しますか？`)) {
+                              await deleteDoc(doc(db, 'members', m.id));
+                            }
+                          }}
+                          className="text-red-500 hover:bg-red-50 font-bold px-2.5 py-1 rounded-lg"
+                        >
+                          削除
+                        </button>
+                      </div>
+                    ))
+                  )}
                 </div>
               </div>
-            )}
+            </div>
           </div>
         )}
       </main>
 
       {/* =========================================
-          【4】カード詳細・優先度・複数部署変更・コメント履歴モーダル
+          【モーダル1】1on1ログ詳細（部長専用メモの閲覧制御つき）
       ========================================= */}
-      {selectedTask && (
+      {selectedLog && (
         <div
-          onClick={() => {
-            setSelectedTaskId(null);
-            setModalCommentText('');
-          }}
+          onClick={() => setSelectedLogId(null)}
           className="fixed inset-0 bg-slate-900/50 backdrop-blur-xs z-50 flex items-center justify-center p-4"
         >
           <div
             onClick={(e) => e.stopPropagation()}
             className="bg-white rounded-3xl shadow-2xl border border-slate-200 max-w-2xl w-full max-h-[88vh] flex flex-col overflow-hidden"
           >
-            {/* モーダルヘッダー */}
-            <div className="px-6 py-4 bg-slate-50 border-b border-slate-200/80 flex items-start justify-between gap-4">
-              <div className="space-y-1.5">
-                <div className="flex flex-wrap items-center gap-1.5">
-                  {selectedTask.priority === '急ぎ' && (
-                    <span className="text-xs font-extrabold bg-rose-100 text-rose-700 border border-rose-200 px-2.5 py-0.5 rounded-full">
-                      🔥 急ぎ
-                    </span>
-                  )}
-                  <span
-                    className={`text-xs font-bold px-2.5 py-0.5 rounded-full ${
-                      selectedTask.status === '完了'
-                        ? 'bg-emerald-100 text-emerald-700'
-                        : selectedTask.status === '対応中'
-                        ? 'bg-amber-100 text-amber-700'
-                        : 'bg-blue-100 text-blue-700'
-                    }`}
-                  >
-                    {selectedTask.status}
+            <div className="px-6 py-4 bg-slate-50 border-b border-slate-200 flex items-start justify-between gap-4">
+              <div>
+                <div className="flex flex-wrap items-center gap-2 mb-1">
+                  <span className="text-xs font-bold bg-slate-200 text-slate-700 px-2.5 py-0.5 rounded-full">
+                    {selectedLog.meetingDate}
                   </span>
-                  {selectedTaskDepts.map((dName) => (
-                    <span
-                      key={dName}
-                      className="text-xs font-bold bg-blue-50 text-blue-700 border border-blue-100 px-2.5 py-0.5 rounded-full"
-                    >
-                      🤖 {dName}
-                    </span>
-                  ))}
-                  <span className="text-xs text-slate-400">
-                    {formatTimestamp(selectedTask.createdAt)}
+                  <span className="text-xs font-bold bg-emerald-50 text-emerald-700 px-2.5 py-0.5 rounded-full">
+                    {selectedLog.department}
+                  </span>
+                  <span
+                    className={`text-xs font-bold px-2.5 py-0.5 rounded-full border ${riskBadgeStyle(
+                      selectedLog.aiSummary?.riskLevel
+                    )}`}
+                  >
+                    {selectedLog.aiSummary?.riskLevel || '通常'}
                   </span>
                 </div>
-                <h3 className="text-lg font-black text-slate-900">{selectedTask.title}</h3>
+                <h3 className="text-lg font-black text-slate-900">
+                  👤 {selectedLog.memberName} さんの1on1記録
+                </h3>
+                <p className="text-[11px] text-slate-400">
+                  閲覧可能：{selectedLog.managerName}（{selectedLog.managerEmail}）＆{' '}
+                  {selectedLog.memberName}（{selectedLog.memberEmail}）
+                </p>
               </div>
               <button
-                onClick={() => {
-                  setSelectedTaskId(null);
-                  setModalCommentText('');
-                }}
-                className="text-slate-400 hover:text-slate-700 bg-white border border-slate-200 w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold shrink-0"
+                onClick={() => setSelectedLogId(null)}
+                className="w-8 h-8 rounded-full bg-white border border-slate-200 text-slate-500 font-bold"
               >
                 ✕
               </button>
             </div>
 
-            {/* モーダル本文 */}
-            <div className="flex-1 overflow-y-auto p-6 space-y-5">
-              <div className="bg-slate-50/90 p-4 rounded-2xl border border-slate-200/70 space-y-2">
-                <div className="flex items-center justify-between text-xs text-slate-500">
-                  <span>
-                    依頼者：<strong>{selectedTask.creatorName || '社員'}</strong>
-                    {selectedTask.creatorEmail ? ` (${selectedTask.creatorEmail})` : ''}
+            <div className="flex-1 overflow-y-auto p-6 space-y-5 text-sm">
+              {/* ★部長（記録者本人）にだけ見える非公開メモ */}
+              {selectedLog.managerEmail.toLowerCase() === userEmail && selectedLog.privateMemo && (
+                <div className="bg-slate-900 text-white p-4 rounded-2xl space-y-1">
+                  <span className="text-[11px] font-bold text-amber-300 block">
+                    🔒 部長専用メモ（あなたにだけ表示されています）
                   </span>
-                </div>
-                <p className="text-sm text-slate-700 leading-relaxed whitespace-pre-wrap">
-                  {selectedTask.detail}
-                </p>
-                {selectedTask.aiReason && (
-                  <p className="text-xs text-blue-700 bg-blue-50/80 p-2.5 rounded-xl">
-                    💡 {selectedTask.aiReason}
+                  <p className="text-xs leading-relaxed whitespace-pre-wrap">
+                    {selectedLog.privateMemo}
                   </p>
-                )}
-              </div>
-
-              {/* ステータス ＆ 優先度コントロール */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div className="bg-white p-3.5 rounded-2xl border border-slate-200 flex flex-col gap-2">
-                  <span className="text-xs font-bold text-slate-600">ステータス変更</span>
-                  <div className="flex flex-wrap gap-1.5">
-                    {(['未処理', '対応中', '完了'] as const).map((st) => {
-                      const active = selectedTask.status === st;
-                      return (
-                        <button
-                          key={st}
-                          onClick={() => handleStatusChange(selectedTask, st)}
-                          className={`text-xs font-bold px-3 py-1.5 rounded-xl transition-all ${
-                            active
-                              ? 'bg-slate-900 text-white shadow-xs'
-                              : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
-                          }`}
-                        >
-                          {st}
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-
-                <div className="bg-white p-3.5 rounded-2xl border border-slate-200 flex flex-col gap-2">
-                  <span className="text-xs font-bold text-slate-600">優先度</span>
-                  <div className="flex gap-1.5">
-                    {(['通常', '急ぎ'] as const).map((p) => {
-                      const currentP: TaskPriority =
-                        selectedTask.priority === '急ぎ' ? '急ぎ' : '通常';
-                      const active = currentP === p;
-                      return (
-                        <button
-                          key={p}
-                          onClick={() => handlePriorityChange(selectedTask, p)}
-                          className={`text-xs font-bold px-3.5 py-1.5 rounded-xl transition-all ${
-                            active
-                              ? p === '急ぎ'
-                                ? 'bg-rose-600 text-white shadow-xs'
-                                : 'bg-slate-900 text-white shadow-xs'
-                              : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
-                          }`}
-                        >
-                          {p === '急ぎ' ? '🔥 急ぎ' : '通常'}
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-              </div>
-
-              {/* 担当部署の変更・複数追加バー */}
-              {modalSelectableDeptNames.length > 0 && (
-                <div className="bg-indigo-50/50 p-4 rounded-2xl border border-indigo-200/80 space-y-3">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-xs font-bold text-indigo-900">
-                      🔀 担当部署の変更・複数追加（{editTaskDepts.length}部署選択中）
-                    </span>
-                    <button
-                      onClick={() => handleUpdateTaskDepartments(selectedTask)}
-                      disabled={
-                        isUpdatingDepts ||
-                        editTaskDepts.length === 0 ||
-                        isSameDeptSet(selectedTaskDepts, editTaskDepts)
-                      }
-                      className="bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 text-white text-xs font-bold px-4 py-1.5 rounded-xl shrink-0 transition-colors"
-                    >
-                      {isUpdatingDepts ? '更新中...' : '担当部署を更新'}
-                    </button>
-                  </div>
-                  <div className="flex flex-wrap gap-2">
-                    {modalSelectableDeptNames.map((deptName) => {
-                      const checked = editTaskDepts.includes(deptName);
-                      return (
-                        <button
-                          key={deptName}
-                          type="button"
-                          onClick={() => handleToggleModalDept(deptName)}
-                          className={`text-xs font-bold px-3 py-1.5 rounded-xl border transition-all flex items-center gap-1.5 ${
-                            checked
-                              ? 'bg-indigo-600 text-white border-indigo-600 shadow-2xs'
-                              : 'bg-white text-slate-700 border-indigo-200 hover:bg-indigo-50'
-                          }`}
-                        >
-                          <span>{checked ? '☑' : '☐'}</span>
-                          {deptName}
-                        </button>
-                      );
-                    })}
-                  </div>
                 </div>
               )}
 
-              {/* コメント・対応履歴タイムライン */}
-              <div className="space-y-3">
-                <h4 className="text-sm font-bold text-slate-800 flex items-center gap-1.5">
-                  🕒 コメント・対応履歴（{modalHistoryList.length}件）
-                </h4>
-
-                <div className="space-y-2.5">
-                  {modalHistoryList.map((item) => (
-                    <div
-                      key={item.id}
-                      className={`p-3.5 rounded-2xl border text-xs ${
-                        item.type === 'transfer'
-                          ? 'bg-purple-50/60 border-purple-200 text-slate-700'
-                          : item.type === 'priority'
-                          ? 'bg-rose-50/50 border-rose-200 text-slate-700'
-                          : item.type === 'status'
-                          ? 'bg-indigo-50/50 border-indigo-100 text-slate-700'
-                          : 'bg-white border-slate-200/80 text-slate-800 shadow-2xs'
-                      }`}
-                    >
-                      <div className="flex items-center justify-between gap-2 mb-1">
-                        <span className="font-bold text-slate-800">
-                          {item.type === 'transfer'
-                            ? '🔀 '
-                            : item.type === 'priority'
-                            ? '🔥 '
-                            : item.type === 'status'
-                            ? '🔄 '
-                            : '💬 '}
-                          {item.actorName}
-                        </span>
-                        <span className="text-[10px] text-slate-400">{item.createdAtLabel}</span>
-                      </div>
-                      <p className="leading-relaxed whitespace-pre-wrap">{item.text}</p>
-                    </div>
-                  ))}
+              <div className="space-y-3 bg-emerald-50/40 p-4 rounded-2xl border border-emerald-100">
+                <h4 className="font-bold text-emerald-900 text-xs">🤖 AI要約：面談内容</h4>
+                <p className="text-slate-800 leading-relaxed">{selectedLog.aiSummary?.overview}</p>
+                <div className="text-xs space-y-2 text-slate-700 pt-2 border-t border-emerald-100">
+                  <p>
+                    <strong>・現状の課題：</strong>
+                    {selectedLog.aiSummary?.issues}
+                  </p>
+                  <p>
+                    <strong>・背景：</strong>
+                    {selectedLog.aiSummary?.background}
+                  </p>
+                  <p>
+                    <strong>・解決に向けた方向性：</strong>
+                    {selectedLog.aiSummary?.direction}
+                  </p>
                 </div>
+              </div>
+
+              {selectedLog.aiSummary?.nextActions && selectedLog.aiSummary.nextActions.length > 0 && (
+                <div className="space-y-1.5">
+                  <h4 className="font-bold text-slate-800 text-xs">📋 ネクストアクション</h4>
+                  <ul className="list-disc pl-5 text-xs text-slate-700 space-y-1">
+                    {selectedLog.aiSummary.nextActions.map((a, i) => (
+                      <li key={i}>{a}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {selectedLog.docUrl && (
+                <div className="text-xs">
+                  <span className="font-bold text-slate-600">元ドキュメント：</span>
+                  <a
+                    href={selectedLog.docUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-emerald-700 underline break-all"
+                  >
+                    {selectedLog.docUrl}
+                  </a>
+                </div>
+              )}
+
+              {selectedLog.transcript && (
+                <div className="space-y-1.5">
+                  <h4 className="font-bold text-slate-800 text-xs">🗣️ 会話ログ全文</h4>
+                  <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 text-xs text-slate-600 leading-relaxed whitespace-pre-wrap max-h-60 overflow-y-auto">
+                    {selectedLog.transcript}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* =========================================
+          【モーダル2】課題詳細・コメント履歴モーダル
+      ========================================= */}
+      {selectedAction && (
+        <div
+          onClick={() => setSelectedActionId(null)}
+          className="fixed inset-0 bg-slate-900/50 backdrop-blur-xs z-50 flex items-center justify-center p-4"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="bg-white rounded-3xl shadow-2xl border border-slate-200 max-w-xl w-full max-h-[86vh] flex flex-col overflow-hidden"
+          >
+            <div className="px-6 py-4 bg-slate-50 border-b border-slate-200 flex items-start justify-between gap-4">
+              <div>
+                <div className="flex flex-wrap items-center gap-1.5 mb-1">
+                  <span className="text-xs font-bold bg-emerald-50 text-emerald-700 px-2.5 py-0.5 rounded-full">
+                    👤 {selectedAction.memberName}（{selectedAction.department}）
+                  </span>
+                  <span className="text-xs text-slate-400">
+                    {formatTimestamp(selectedAction.createdAt)}
+                  </span>
+                </div>
+                <h3 className="text-base font-black text-slate-900">{selectedAction.title}</h3>
+              </div>
+              <button
+                onClick={() => setSelectedActionId(null)}
+                className="w-8 h-8 rounded-full bg-white border border-slate-200 text-slate-500 font-bold"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto p-6 space-y-4">
+              <p className="text-xs text-slate-600 bg-slate-50 p-3.5 rounded-2xl border border-slate-200/70">
+                {selectedAction.detail}
+              </p>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div className="border border-slate-200 rounded-2xl p-3 space-y-1.5">
+                  <span className="text-[11px] font-bold text-slate-500 block">ステータス</span>
+                  <div className="flex flex-wrap gap-1">
+                    {(['未着手', '対応中', '完了'] as const).map((st) => (
+                      <button
+                        key={st}
+                        onClick={() => handleChangeActionStatus(selectedAction, st)}
+                        className={`text-xs font-bold px-2.5 py-1 rounded-lg ${
+                          selectedAction.status === st
+                            ? 'bg-slate-900 text-white'
+                            : 'bg-slate-100 text-slate-600'
+                        }`}
+                      >
+                        {st}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div className="border border-slate-200 rounded-2xl p-3 space-y-1.5">
+                  <span className="text-[11px] font-bold text-slate-500 block">優先度</span>
+                  <div className="flex gap-1">
+                    {(['通常', '急ぎ'] as const).map((p) => (
+                      <button
+                        key={p}
+                        onClick={() => handleChangeActionPriority(selectedAction, p)}
+                        className={`text-xs font-bold px-3 py-1 rounded-lg ${
+                          selectedAction.priority === p
+                            ? p === '急ぎ'
+                              ? 'bg-rose-600 text-white'
+                              : 'bg-slate-900 text-white'
+                            : 'bg-slate-100 text-slate-600'
+                        }`}
+                      >
+                        {p === '急ぎ' ? '🔥 急ぎ' : '通常'}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <h4 className="text-xs font-bold text-slate-700">
+                  🕒 フォロー履歴（{selectedAction.history?.length || 0}件）
+                </h4>
+                {(selectedAction.history || []).map((h) => (
+                  <div
+                    key={h.id}
+                    className="p-3 rounded-xl border border-slate-200/80 bg-white text-xs"
+                  >
+                    <div className="flex justify-between text-[10px] text-slate-400 mb-1">
+                      <span className="font-bold text-slate-700">{h.actorName}</span>
+                      <span>{h.createdAtLabel}</span>
+                    </div>
+                    <p className="text-slate-700 whitespace-pre-wrap">{h.text}</p>
+                  </div>
+                ))}
               </div>
             </div>
 
-            {/* コメント入力フッター */}
-            <div className="p-4 bg-slate-50 border-t border-slate-200/80">
-              <div className="flex gap-2">
-                <input
-                  type="text"
-                  placeholder="コメントを入力（依頼者・担当部長へメール通知されます）..."
-                  value={modalCommentText}
-                  onChange={(e) => setModalCommentText(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
-                      handleAddModalComment(selectedTask);
-                    }
-                  }}
-                  className="flex-1 bg-white border border-slate-200 rounded-xl px-4 py-2.5 text-sm outline-none focus:ring-2 focus:ring-blue-500"
-                />
-                <button
-                  onClick={() => handleAddModalComment(selectedTask)}
-                  disabled={isPostingComment || !modalCommentText.trim()}
-                  className="bg-blue-600 hover:bg-blue-700 disabled:bg-slate-300 text-white font-bold px-5 py-2.5 rounded-xl text-sm shrink-0"
-                >
-                  {isPostingComment ? '送信中...' : '投稿'}
-                </button>
-              </div>
+            <div className="p-4 bg-slate-50 border-t border-slate-200 flex gap-2">
+              <input
+                type="text"
+                placeholder="進捗メモやコメントを追加..."
+                value={modalCommentText}
+                onChange={(e) => setModalCommentText(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
+                    handleAddActionComment(selectedAction);
+                  }
+                }}
+                className="flex-1 bg-white border border-slate-200 rounded-xl px-3.5 py-2 text-xs outline-none focus:ring-2 focus:ring-emerald-500"
+              />
+              <button
+                onClick={() => handleAddActionComment(selectedAction)}
+                disabled={isPostingComment || !modalCommentText.trim()}
+                className="bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-300 text-white font-bold px-4 py-2 rounded-xl text-xs"
+              >
+                投稿
+              </button>
             </div>
           </div>
         </div>
